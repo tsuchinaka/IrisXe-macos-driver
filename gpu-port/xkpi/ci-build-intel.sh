@@ -72,6 +72,8 @@ fi
 rm -rf "$NMX_X"; mkdir -p "$NMX_X"
 cp -R "$HERE/." "$NMX_X/" || { say "**could not copy the port to $NMX_X**"; exit 1; }
 cd "$NMX_X" || exit 1
+# a zip or web upload of the repo drops the executable bit; the stage scripts call each other as ./name.sh
+chmod +x ./*.sh kext/*.sh kext-npu/*.sh 2>/dev/null
 mkdir -p obj obj-i915 lkobj lklogs srcobj xnuobj logs logs-i915 fbroot
 
 # run <name> <command...>: runs a stage, keeps its output, never aborts the whole build

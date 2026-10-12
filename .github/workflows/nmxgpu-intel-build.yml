@@ -35,7 +35,7 @@ jobs:
           DRM_KMOD_REF: ${{ inputs.drm_kmod_ref }}
           FREEBSD_REF: ${{ inputs.freebsd_ref }}
           NMX_NO_XE: ${{ inputs.no_xe }}
-        run: gpu-port/xkpi/ci-build-intel.sh "$RUNNER_TEMP/nmx"
+        run: bash gpu-port/xkpi/ci-build-intel.sh "$RUNNER_TEMP/nmx"
 
       - name: Upload logs and kext
         if: always()
