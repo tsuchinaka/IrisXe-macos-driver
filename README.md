@@ -21,7 +21,8 @@ Sonoma and documenting it. The original NVIDIA README is kept at [`docs/README-N
 | Compiles on macOS 14 runner, Xcode 15.4, SDK 14.5 (x86_64) | **Done.** 900 core + 274 i915 + 75 runtime sources, 0 failures |
 | Links `NMXGPU.kext` (13.4 MB, Mach-O x86_64 kext bundle) | **Done.** 0 internally-missing symbols; 544 undefined, all kernel KPI |
 | Symbols resolve against Sonoma's real kernel collection | Not checked |
-| Kext loads, i915 attaches headless (`nmxintel=1 nmxnofb=1`) | Not tested |
+| Kext loads on Sonoma 14.8.9, all symbols resolve, firmware found, boot guard works | **Done** (hardware test, 2026-10-13) |
+| i915 attaches headless (`nmxintel=1 nmxnofb=1`) | **Failed once**: kernel panic in Type-C port init (`icl_tc_phy_hpd_live_status`, NULL `pch_hpd`) because i915 could not see the chipset's LPC bridge. Fix applied in `bsdcompat/src/nmx_bus.c`; **retest pending** |
 | DRM nodes (`NMDRM`) and Vulkan through ANV on the real device | Not tested |
 | `NMXAccel` accelerator shows a Metal device on Sonoma | Not tested. Most likely stage to need code changes |
 | Display output through the driver | Not tested |

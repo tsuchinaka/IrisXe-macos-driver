@@ -1143,6 +1143,15 @@ device_t pci_find_class_from(uint8_t cls, uint8_t subcls, device_t from)
 {
     device_t d, found = NULL;
     int past = from == NULL;
+    /*
+     * all_devices only holds PCI devices the port has already wrapped (the GPU, plus whatever a lookup by address
+     * made). i915 finds its PCH by scanning for the ISA (LPC) bridge; if the scan comes back empty, pch_type stays
+     * PCH_NONE, display.hotplug.pch_hpd stays NULL and Tiger Lake's Type-C port init reads through it (first hardware
+     * test, 10-13: page fault at 0x24 in icl_tc_phy_hpd_live_status). Every Intel platform with a PCH has its
+     * LPC/eSPI bridge at 00:1f.0, so wrap that function (config reads only) before an ISA-bridge scan starts.
+     */
+    if (from == NULL && cls == PCIC_BRIDGE && subcls == PCIS_BRIDGE_ISA)
+        (void)pci_find_dbsf(0, 0, 0x1f, 0);
     mtx_lock(&bus_mtx);
     TAILQ_FOREACH(d, &all_devices, all) {
         if (!past) { past = d == from; continue; }
