@@ -120,7 +120,7 @@ fi
 for st in core i915 runtime link; do
     if [ -s "$CI/$st.txt" ]; then
         say ""; say "### $st: last lines"; say '```'
-        tail -n 45 "$CI/$st.txt" >> "$SUM"
+        tail -n 45 "$CI/$st.txt" | tee -a "$SUM"
         say '```'
     fi
 done
