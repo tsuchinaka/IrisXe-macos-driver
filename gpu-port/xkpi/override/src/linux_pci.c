@@ -86,6 +86,14 @@
 #include "backlight_if.h"
 #include "pcib_if.h"
 
+/*
+ * Upstream LinuxKPI no longer declares these in <linux/pci.h> (it keeps its own static lkpi_pci_* copies).
+ * This fork still uses the old global list/lock, which override/src/linux_compat.c defines and initialises.
+ */
+extern struct list_head pci_drivers;
+extern struct list_head pci_devices;
+extern spinlock_t pci_lock;
+
 /* Undef the linux function macro defined in linux/pci.h */
 #undef pci_get_class
 

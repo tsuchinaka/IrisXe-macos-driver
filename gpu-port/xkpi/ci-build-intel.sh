@@ -52,16 +52,17 @@ group "fetch sources"
 if [ -z "${NMX_SKIP_FETCH:-}" ]; then
     DK=$(fetch https://github.com/freebsd/drm-kmod.git "$DRM_KMOD_REF" "$NMX_K/drm-kmod") \
         || { say "- **FAILED** fetching drm-kmod ($DRM_KMOD_REF)"; DK=""; }
-    FB=$(fetch https://github.com/freebsd/freebsd-src.git "$FREEBSD_REF" "$NMX_K/freebsd-src" sys/compat/linuxkpi sys/contrib/ck) \
+    FB=$(fetch https://github.com/freebsd/freebsd-src.git "$FREEBSD_REF" "$NMX_K/freebsd-src" sys/compat/linuxkpi sys/contrib/ck sys/contrib/dev/acpica/include) \
         || { say "- **FAILED** fetching freebsd-src ($FREEBSD_REF)"; FB=""; }
     say "- drm-kmod $DRM_KMOD_REF = \`${DK:-unknown}\`"
-    say "- freebsd-src $FREEBSD_REF = \`${FB:-unknown}\` (sys/compat/linuxkpi, sys/contrib/ck)"
+    say "- freebsd-src $FREEBSD_REF = \`${FB:-unknown}\` (sys/compat/linuxkpi, sys/contrib/ck, sys/contrib/dev/acpica/include)"
 else
     say "- sources reused from $NMX_K"
 fi
 endgroup
 for need in drm-kmod/kconfig.mk drm-kmod/amd/amdgpu/Makefile drm-kmod/i915/Makefile \
-            freebsd-src/sys/compat/linuxkpi/common/include freebsd-src/sys/contrib/ck/src/ck_epoch.c; do
+            freebsd-src/sys/compat/linuxkpi/common/include freebsd-src/sys/contrib/ck/src/ck_epoch.c \
+            freebsd-src/sys/contrib/dev/acpica/include/acpi.h; do
     [ -e "$NMX_K/$need" ] || { say "- **MISSING** \`$need\`"; MISSING=1; }
 done
 if [ -n "${MISSING:-}" ]; then
@@ -75,6 +76,9 @@ cd "$NMX_X" || exit 1
 # a zip or web upload of the repo drops the executable bit; the stage scripts call each other as ./name.sh
 chmod +x ./*.sh kext/*.sh kext-npu/*.sh 2>/dev/null
 mkdir -p obj obj-i915 lkobj lklogs srcobj xnuobj logs logs-i915 fbroot
+# fbroot is an include root: FreeBSD sources write <compat/linuxkpi/...> and <contrib/...>, relative to sys/
+ln -sfn "$NMX_K/freebsd-src/sys/compat" fbroot/compat
+ln -sfn "$NMX_K/freebsd-src/sys/contrib" fbroot/contrib
 
 # run <name> <command...>: runs a stage, keeps its output, never aborts the whole build
 run() {
@@ -116,11 +120,13 @@ fi
 for st in core i915 runtime link; do
     if [ -s "$CI/$st.txt" ]; then
         say ""; say "### $st: last lines"; say '```'
-        tail -n 45 "$CI/$st.txt" >> "$SUM"
+        tail -n 45 "$CI/$st.txt" | tee -a "$SUM"
         say '```'
     fi
 done
 
 tar czf "$CI/logs.tgz" -C "$NMX_X" logs logs-i915 lklogs srclog_*.txt xlog_*.txt link.log srcs.txt srcs-i915.txt amd.flags 2>/dev/null || true
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$SUM" >> "$GITHUB_STEP_SUMMARY"
+# a green run must mean the kext linked
+[ -f "$W/out/NMXGPU.kext/Contents/MacOS/NMXGPU" ] || exit 1
 exit 0
