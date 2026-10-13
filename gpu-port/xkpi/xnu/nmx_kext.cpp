@@ -244,7 +244,7 @@ static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
             volatile uint32_t *fbp = (volatile uint32_t *)ap->getVirtualAddress();
             static const uint32_t win[] = { 0, 0x100000, 0x400000, 0x800000, 0xc00000, 0xf00000 };
             for (unsigned i = 0; i < sizeof(win) / sizeof(win[0]); i++) {
-                uint32_t nz = 0, first = 0;
+                uint32_t nz = 0, nb = 0, first = 0, firstnb = 0;
                 for (uint32_t j = 0; j < 16384; j++) {
                     uint32_t v = fbp[win[i] / 4 + j];
                     if (v != 0) {
@@ -252,8 +252,14 @@ static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
                             first = v;
                         nz++;
                     }
+                    if ((v & 0x00ffffff) != 0) {    /* a pixel with any colour in it: text or a drawn window, not black */
+                        if (nb == 0)
+                            firstnb = v;
+                        nb++;
+                    }
                 }
-                IOLog("NullMoth DISP[%s] FB[0x%x] nonzero=%u/16384 first=0x%08x\n", tag, win[i], nz, first);
+                IOLog("NullMoth DISP[%s] FB[0x%x] nonzero=%u/16384 coloured=%u/16384 first=0x%08x firstcoloured=0x%08x\n", tag,
+                      win[i], nz, nb, first, firstnb);
             }
         }
         ap->release();
@@ -316,16 +322,27 @@ void NMXGPU::attachNow()
         { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
-    PMinit();
-    pci_->joinPMtree(this);
-    registerPowerDriver(this, states, 2);
-    pm_ = true;
-    makeUsable(); /* hold the device at full power: a bare PM registration can leave it at state 0, which suspends the display */
+    /* experiment knobs for the black-screen hunt: nmxnopm=1 skips the power-management registration, nmxnoclaim=1 skips the
+       claim property and the re-match on the PCI device. Both off by default. */
+    uint32_t knob = 0;
+    bool nopm = PE_parse_boot_argn("nmxnopm", &knob, sizeof(knob)) && knob != 0;
+    knob = 0;
+    bool noclaim = PE_parse_boot_argn("nmxnoclaim", &knob, sizeof(knob)) && knob != 0;
+    IOLog("NullMoth GPU: experiment knobs: nmxnopm=%d nmxnoclaim=%d\n", nopm ? 1 : 0, noclaim ? 1 : 0);
+    if (!nopm) {
+        PMinit();
+        pci_->joinPMtree(this);
+        registerPowerDriver(this, states, 2);
+        pm_ = true;
+        makeUsable(); /* hold the device at full power: a bare PM registration can leave it at state 0, which suspends the display */
+    }
     registerService();
     /* NMXAccel (the Metal accelerator for this GPU) starts only on a device this driver has claimed; it declined while
        the claim was pending, so matching on the device runs again now that it is set */
-    pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
-    pci_->registerService();
+    if (!noclaim) {
+        pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
+        pci_->registerService();
+    }
     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
     if (headless(pci_->configRead16(kIOPCIConfigVendorID))) {
         IOLog("NullMoth GPU: nmxnofb=1: display bridge not published; the screen stays as the firmware left it\n");
@@ -344,6 +361,12 @@ void NMXGPU::attachNow()
     nmx_dump_display(pci_, "attach+3s");
     IOSleep(10000);
     nmx_dump_display(pci_, "attach+13s");
+    IOSleep(17000);
+    nmx_dump_display(pci_, "attach+30s");
+    IOSleep(30000);
+    nmx_dump_display(pci_, "attach+60s");
+    IOSleep(60000);
+    nmx_dump_display(pci_, "attach+120s");
 }
 
 void NMXGPU::stop(IOService *provider)

@@ -22,7 +22,7 @@ Sonoma and documenting it. The original NVIDIA README is kept at [`docs/README-N
 | Links `NMXGPU.kext` (13.4 MB, Mach-O x86_64 kext bundle) | **Done.** 0 internally-missing symbols; 544 undefined, all kernel KPI |
 | Symbols resolve against Sonoma's real kernel collection | Not checked |
 | Kext loads on Sonoma 14.8.9, all symbols resolve, firmware found, boot guard works | **Done** (hardware test, 2026-10-13) |
-| i915 attaches headless (`nmxintel=1 nmxnofb=1`) | Probe succeeds. Screen still dark with GGTT intact and display registers unchanged; suspect i915 overwrites the framebuffer contents in stolen memory (the port gives it the whole stolen range). Build reserves the first 32 MiB of stolen memory and GGTT (patch_i915_*_fwfb.py) and logs framebuffer contents; retest pending |
+| i915 attaches headless (`nmxintel=1 nmxnofb=1`) | Probe succeeds; GGTT, stolen memory and display registers verified intact. Screen still black; macOS fills the framebuffer with black after attach. Suspect the IOKit side (power-management / claim on the PCI device); boot-arg experiments nmxnopm / nmxnoclaim added; retest pending |
 | DRM nodes (`NMDRM`) and Vulkan through ANV on the real device | Not tested |
 | `NMXAccel` accelerator shows a Metal device on Sonoma | Not tested. Most likely stage to need code changes |
 | Display output through the driver | Not tested |
