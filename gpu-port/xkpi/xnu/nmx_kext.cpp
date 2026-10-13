@@ -40,6 +40,7 @@ class NMXGPU : public IOService {
     IOPCIDevice *pci_;
     volatile int attach_;   /* 0 = attach pending on its thread, 1 = attached, -1 = not attached */
     bool pm_;
+    bool powered_ = true; /* the device is on from the moment it attaches; IOKit's first state-0 call must not suspend it */
     static void attachThread(void *arg, wait_result_t);
     void attachNow();
 public:
@@ -47,6 +48,7 @@ public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
     IOReturn setPowerState(unsigned long state, IOService *device) override;
+    unsigned long initialPowerStateForDomainState(IOPMPowerFlags) override { return 1; }
     void systemWillShutdown(IOOptionBits spec) override;
 };
 OSDefineMetaClassAndStructors(NMXGPU, IOService)
@@ -231,6 +233,7 @@ void NMXGPU::attachNow()
     pci_->joinPMtree(this);
     registerPowerDriver(this, states, 2);
     pm_ = true;
+    makeUsable(); /* hold the device at full power: a bare PM registration can leave it at state 0, which suspends the display */
     registerService();
     /* NMXAccel (the Metal accelerator for this GPU) starts only on a device this driver has claimed; it declined while
        the claim was pending, so matching on the device runs again now that it is set */
@@ -274,8 +277,10 @@ void NMXGPU::stop(IOService *provider)
 /* state 0 = sleep, 1 = on */
 IOReturn NMXGPU::setPowerState(unsigned long state, IOService *device)
 {
-    if (dev_ != nullptr) {
+    IOLog("NullMoth GPU: power state %lu requested (device is %s)\n", state, powered_ ? "on" : "off");
+    if (dev_ != nullptr && (state != 0) != powered_) {
         int err = nmx_port_power(dev_, state != 0);
+        powered_ = state != 0;
         if (err)
             IOLog("NullMoth GPU: %s returned %d\n", state ? "resume" : "suspend", err);
     }
