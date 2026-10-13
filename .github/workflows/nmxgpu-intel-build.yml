@@ -10,10 +10,10 @@ on:
         default: "14.0"
       drm_kmod_ref:
         description: freebsd/drm-kmod branch, tag or commit
-        default: master
+        default: c16de0f9fa84f70b9551f69fde837a7f3a73c0e9
       freebsd_ref:
         description: freebsd/freebsd-src branch, tag or commit (LinuxKPI headers)
-        default: main
+        default: b42793d4bcdf73475b77a26c9dbacd45f8876621
       no_xe:
         description: "1 = leave the xe driver out (Tiger Lake and older use i915); empty = build it too (needs Linux 6.14 sources, not fetched here)"
         default: "1"
