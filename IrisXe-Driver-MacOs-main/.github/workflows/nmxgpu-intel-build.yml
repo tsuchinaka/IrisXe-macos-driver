@@ -1,0 +1,48 @@
+name: NMXGPU Intel (i915) kext build
+
+# Manual only: a full run compiles about 1,250 sources. Result: a build summary on the run page, the logs, and
+# NMXGPU.kext when the link works. Run it on a fork of this repository: Actions > this workflow > Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      min_os:
+        description: macOS deployment target of the kext (14.0 = Sonoma)
+        default: "14.0"
+      drm_kmod_ref:
+        description: freebsd/drm-kmod branch, tag or commit
+        default: c16de0f9fa84f70b9551f69fde837a7f3a73c0e9
+      freebsd_ref:
+        description: freebsd/freebsd-src branch, tag or commit (LinuxKPI headers)
+        default: b42793d4bcdf73475b77a26c9dbacd45f8876621
+      no_xe:
+        description: "1 = leave the xe driver out (Tiger Lake and older use i915); empty = build it too (needs Linux 6.14 sources, not fetched here)"
+        default: "1"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build NMXGPU.kext (Intel)
+        env:
+          NMX_MIN_OS: ${{ inputs.min_os }}
+          DRM_KMOD_REF: ${{ inputs.drm_kmod_ref }}
+          FREEBSD_REF: ${{ inputs.freebsd_ref }}
+          NMX_NO_XE: ${{ inputs.no_xe }}
+        run: bash gpu-port/xkpi/ci-build-intel.sh "$RUNNER_TEMP/nmx"
+
+      - name: Upload logs and kext
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nmxgpu-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/nmx/ci
+            ${{ runner.temp }}/nmx/out
+          if-no-files-found: warn

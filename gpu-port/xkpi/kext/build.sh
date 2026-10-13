@@ -19,7 +19,7 @@ fi
 K="$OUT/NMXGPU.kext/Contents"
 mkdir -p "$K/MacOS"
 xcrun clang -arch x86_64 -mmacosx-version-min=${NMX_MIN_OS:-15.0} -fapple-kext -nostdlib -Xlinker -kext \
-  obj/*.o obj-i915/*.o $XEOBJ lkobj/*.o srcobj/*.o $(ls xnuobj/*.o | grep -v '/nmx_npu_kext\.o$') -lkmodc++ -lkmod -lcc_kext -o "$K/MacOS/NMXGPU" 2> link.log || {
+  obj/*.o obj-i915/*.o $XEOBJ lkobj/*.o srcobj/*.o xnuobj/*.o -lkmodc++ -lkmod -lcc_kext -o "$K/MacOS/NMXGPU" 2> link.log || {
     grep -E "error|Undefined|duplicate" link.log | head -40; exit 1; }
 cp kext/Info.plist "$K/Info.plist"
 echo "NMXGPU $(shasum -a 256 "$K/MacOS/NMXGPU" | cut -c1-8) $(stat -f %z "$K/MacOS/NMXGPU") B"

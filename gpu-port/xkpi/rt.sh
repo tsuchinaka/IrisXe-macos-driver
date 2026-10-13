@@ -28,9 +28,7 @@ for f in bsdcompat/src/*.c; do
     ./ccsrc.sh "$f" > "srclog_$b.txt" 2>&1 || { echo "SRC FAIL $b"; fail=$((fail + 1)); }
 done
 for f in xnu/*.cpp; do
-    b=$(basename "$f" .cpp)
-    [ "$b" = nmx_npu_kext ] && continue   # NMXNPU's own entry point: kext-npu/build.sh compiles it; here it duplicates kmod_info
-    n=$((n + 1))
+    b=$(basename "$f" .cpp); n=$((n + 1))
     ./ccxx.sh "$f" > "xlog_$b.txt" 2>&1 || { echo "XNU FAIL $b"; fail=$((fail + 1)); }
 done
 echo "runtime sources: $n  failed: $fail"

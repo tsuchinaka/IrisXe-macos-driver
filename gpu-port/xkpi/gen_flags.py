@@ -8,7 +8,7 @@ EXCLUDE = {
     "COMPAT",                                       # 32-bit ioctls: macOS 15 runs 64-bit processes only
     "FB", "DRM_FBDEV_EMULATION", "DRM_FBDEV_OVERALLOC", "DRM_CLIENT_DEFAULT_FBDEV", "DRM_CLIENT_DEFAULT",
     "DRM_CLIENT", "DRM_CLIENT_SETUP", "VIDEO_CMDLINE",  # in-kernel fbdev clients: macOS uses IOFramebuffer
-    "DRM_MIPI_DSI", "DRM_PANEL_ORIENTATION_QUIRKS", "DRM_PANEL_BACKLIGHT_QUIRKS", "DRM_DISPLAY_DP_TUNNEL",
+    "DRM_MIPI_DSI", "DRM_PANEL_ORIENTATION_QUIRKS", "DRM_PANEL_BACKLIGHT_QUIRKS", "DRM_DISPLAY_DP_TUNNEL", "DRM_I915_DP_TUNNEL",
 }
 txt = (dk / "kconfig.mk").read_text()
 # amd64 branch, FBDEV branch dropped (excluded anyway)

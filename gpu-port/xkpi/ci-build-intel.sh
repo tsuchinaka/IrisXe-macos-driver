@@ -6,8 +6,8 @@
 #
 #   NMX_MIN_OS     macOS deployment target for the kext objects and the link         (default 14.0, Sonoma)
 #   NMX_NO_XE      1 = leave the xe driver out (Tiger Lake and older are i915)       (default 1)
-#   DRM_KMOD_REF   drm-kmod branch, tag or commit                                    (default: pinned known-good commit)
-#   FREEBSD_REF    freebsd-src branch, tag or commit                                 (default: pinned known-good commit)
+#   DRM_KMOD_REF   drm-kmod branch, tag or commit                                    (default master)
+#   FREEBSD_REF    freebsd-src branch, tag or commit                                 (default main)
 #   NMX_SKIP_FETCH 1 = use the sources already under <workdir>/kpi                   (default unset)
 #
 # Output under <workdir>: out/NMXGPU.kext (if the link worked), ci/summary.md, ci/*.txt, ci/logs.tgz
@@ -20,8 +20,8 @@ export NMX_NO_XE=${NMX_NO_XE:-1}
 export NMX_PY=${NMX_PY:-$(command -v python3)}
 export NMX_K=$W/kpi
 export NMX_X=$W/xkpi
-DRM_KMOD_REF=${DRM_KMOD_REF:-c16de0f9fa84f70b9551f69fde837a7f3a73c0e9}   # pinned: last known-good build (was master)
-FREEBSD_REF=${FREEBSD_REF:-b42793d4bcdf73475b77a26c9dbacd45f8876621}   # pinned: last known-good build (was main; upstream LinuxKPI drifts)
+DRM_KMOD_REF=${DRM_KMOD_REF:-master}
+FREEBSD_REF=${FREEBSD_REF:-main}
 CI=$W/ci
 mkdir -p "$CI" "$W/out" "$NMX_K"
 SUM=$CI/summary.md
