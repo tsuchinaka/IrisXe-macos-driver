@@ -199,6 +199,30 @@ static void nmx_marker_write(bool on)
     n->release();
 }
 
+
+/* read-only snapshot of the display engine (eDP panel power, backlight, pipe A, plane 1, DDI A, power wells) for black-screen
+   diagnosis; reads only, safe at any time the device is powered */
+static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
+{
+    IOMemoryMap *m = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
+    if (m == nullptr) {
+        IOLog("NullMoth DISP[%s] cannot map BAR0\n", tag);
+        return;
+    }
+    volatile uint32_t *r = (volatile uint32_t *)m->getVirtualAddress();
+    static const struct { const char *n; uint32_t o; } regs[] = {
+        { "PP_STATUS", 0xc7200 }, { "PP_CONTROL", 0xc7204 },
+        { "BLC_PWM_CTL1", 0xc8250 }, { "BLC_PWM_FREQ1", 0xc8254 }, { "BLC_PWM_DUTY1", 0xc8258 },
+        { "PIPECONF_A", 0x70008 }, { "PIPE_SRC_A", 0x6001c }, { "TRANS_DDI_FUNC_CTL_A", 0x60400 },
+        { "TRANS_CLK_SEL_A", 0x46140 }, { "DDI_BUF_CTL_A", 0x64000 }, { "DP_TP_CTL_A", 0x64040 },
+        { "PLANE_CTL_1_A", 0x70180 }, { "PLANE_SURF_1_A", 0x7019c }, { "CDCLK_CTL", 0x46000 },
+        { "PWR_WELL_CTL1", 0x45400 }, { "PWR_WELL_CTL2", 0x45404 }, { "DC_STATE_EN", 0x45504 },
+    };
+    for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
+        IOLog("NullMoth DISP[%s] %s=0x%08x\n", tag, regs[i].n, r[regs[i].o / 4]);
+    m->release();
+}
+
 void NMXGPU::attachNow()
 {
     int err = nmx_xnu_wait_firmware_root(300);
@@ -216,6 +240,7 @@ void NMXGPU::attachNow()
         return;
     }
     nmx_marker_write(true);
+    nmx_dump_display(pci_, "before-attach");
     dev_ = nmx_port_attach(pci_);
     if (dev_ == nullptr) {
         nmx_marker_write(false);
@@ -252,6 +277,11 @@ void NMXGPU::attachNow()
           pci_->configRead16(kIOPCIConfigDeviceID));
     OSSynchronizeIO();
     attach_ = 1;
+    nmx_dump_display(pci_, "attach+0s");
+    IOSleep(3000);
+    nmx_dump_display(pci_, "attach+3s");
+    IOSleep(10000);
+    nmx_dump_display(pci_, "attach+13s");
 }
 
 void NMXGPU::stop(IOService *provider)
