@@ -235,6 +235,48 @@ static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
         }
     }
     m->release();
+
+    /* what the plane scans out: count non-zero words in six 64 KiB windows of the framebuffer through the GTT aperture (BAR2),
+       so an emptied picture shows up as 0 and a drawn one does not */
+    IOMemoryMap *ap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2, kIOMapInhibitCache);
+    if (ap != nullptr) {
+        if (ap->getLength() >= 0x1000000) {
+            volatile uint32_t *fbp = (volatile uint32_t *)ap->getVirtualAddress();
+            static const uint32_t win[] = { 0, 0x100000, 0x400000, 0x800000, 0xc00000, 0xf00000 };
+            for (unsigned i = 0; i < sizeof(win) / sizeof(win[0]); i++) {
+                uint32_t nz = 0, first = 0;
+                for (uint32_t j = 0; j < 16384; j++) {
+                    uint32_t v = fbp[win[i] / 4 + j];
+                    if (v != 0) {
+                        if (nz == 0)
+                            first = v;
+                        nz++;
+                    }
+                }
+                IOLog("NullMoth DISP[%s] FB[0x%x] nonzero=%u/16384 first=0x%08x\n", tag, win[i], nz, first);
+            }
+        }
+        ap->release();
+    }
+
+    /* which framebuffer drivers macOS has right now */
+    OSDictionary *match = IOService::serviceMatching("IOFramebuffer");
+    if (match != nullptr) {
+        OSIterator *it = IOService::getMatchingServices(match);
+        unsigned n = 0;
+        if (it != nullptr) {
+            while (OSObject *o = it->getNextObject()) {
+                IOService *svc = OSDynamicCast(IOService, o);
+                if (svc != nullptr) {
+                    IOLog("NullMoth DISP[%s] IOFramebuffer: %s (%s)\n", tag, svc->getName(), svc->getMetaClass()->getClassName());
+                    n++;
+                }
+            }
+            it->release();
+        }
+        IOLog("NullMoth DISP[%s] IOFramebuffer count=%u\n", tag, n);
+        match->release();
+    }
 }
 
 void NMXGPU::attachNow()

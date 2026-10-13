@@ -30,6 +30,12 @@ if [ -n "$GG" ]; then
 else
     echo "ERROR: gt/intel_ggtt.c not found"; exit 1
 fi
+GS=$(find "$K/drm-kmod" -path '*i915/gem/i915_gem_stolen.c' | head -1)
+if [ -n "$GS" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_stolen_fwfb.py "$GS" || { echo "ERROR: stolen framebuffer patch failed"; exit 1; }
+else
+    echo "ERROR: gem/i915_gem_stolen.c not found"; exit 1
+fi
 ${NMX_PY:-/opt/homebrew/bin/python3} srclist.py "$K/drm-kmod" amd.flags i915 2>/dev/null > srcs-i915.all
 : > srcs-i915.txt
 while read -r f; do
