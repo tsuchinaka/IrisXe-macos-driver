@@ -274,7 +274,16 @@ static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
             while (OSObject *o = it->getNextObject()) {
                 IOService *svc = OSDynamicCast(IOService, o);
                 if (svc != nullptr) {
-                    IOLog("NullMoth DISP[%s] IOFramebuffer: %s (%s)\n", tag, svc->getName(), svc->getMetaClass()->getClassName());
+                    IOLog("NullMoth DISP[%s] IOFramebuffer: %s (%s) regID=0x%llx inactive=%d busy=%u state=0x%x\n", tag,
+                          svc->getName(), svc->getMetaClass()->getClassName(), svc->getRegistryEntryID(),
+                          svc->isInactive() ? 1 : 0, (unsigned)svc->getBusyState(), (unsigned)svc->getState());
+                    /* who owns it: walk up the provider chain, so the log shows whether it still hangs off the GPU */
+                    IORegistryEntry *par = svc->getParentEntry(gIOServicePlane);
+                    for (int d = 0; par != nullptr && d < 6; d++) {
+                        IOLog("NullMoth DISP[%s]   parent%d: %s (%s)\n", tag, d, par->getName(),
+                              par->getMetaClass()->getClassName());
+                        par = par->getParentEntry(gIOServicePlane);
+                    }
                     n++;
                 }
             }
