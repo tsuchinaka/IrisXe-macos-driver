@@ -23,6 +23,13 @@ if [ -n "$DP" ]; then
 else
     echo "WARNING: intel_display_params.h not found; display power defaults unchanged"
 fi
+# Keep GEM and i915's error-capture slot out of the GGTT range that still maps the firmware framebuffer (see the script).
+GG=$(find "$K/drm-kmod" -path '*i915/gt/intel_ggtt.c' | head -1)
+if [ -n "$GG" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_fwfb.py "$GG" || { echo "ERROR: firmware framebuffer patch failed"; exit 1; }
+else
+    echo "ERROR: gt/intel_ggtt.c not found"; exit 1
+fi
 ${NMX_PY:-/opt/homebrew/bin/python3} srclist.py "$K/drm-kmod" amd.flags i915 2>/dev/null > srcs-i915.all
 : > srcs-i915.txt
 while read -r f; do

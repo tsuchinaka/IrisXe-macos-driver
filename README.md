@@ -22,7 +22,7 @@ Sonoma and documenting it. The original NVIDIA README is kept at [`docs/README-N
 | Links `NMXGPU.kext` (13.4 MB, Mach-O x86_64 kext bundle) | **Done.** 0 internally-missing symbols; 544 undefined, all kernel KPI |
 | Symbols resolve against Sonoma's real kernel collection | Not checked |
 | Kext loads on Sonoma 14.8.9, all symbols resolve, firmware found, boot guard works | **Done** (hardware test, 2026-10-13) |
-| i915 attaches headless (`nmxintel=1 nmxnofb=1`) | Probe succeeds. Screen froze/went black: i915 enabled panel self-refresh and DC6 while macOS draws into the firmware framebuffer. Build now defaults enable_psr/enable_dc/disable_power_well/enable_fbc to 0; retest pending |
+| i915 attaches headless (`nmxintel=1 nmxnofb=1`) | Probe succeeds. Screen still dark: i915 binds its own pages over the GGTT entries of the firmware framebuffer (page-table dump: entries 0, 1, 100 rewritten). PSR/DC6 ruled out. Build now reserves GGTT [0, 32 MiB) (patch_i915_fwfb.py); retest pending |
 | DRM nodes (`NMDRM`) and Vulkan through ANV on the real device | Not tested |
 | `NMXAccel` accelerator shows a Metal device on Sonoma | Not tested. Most likely stage to need code changes |
 | Display output through the driver | Not tested |
