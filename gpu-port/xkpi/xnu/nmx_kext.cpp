@@ -232,19 +232,6 @@ static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
         for (unsigned i = 0; i < sizeof(pages) / sizeof(pages[0]); i++) {
             uint64_t pte = gsm[pages[i]];
             IOLog("NullMoth DISP[%s] GGTT[%u]=0x%016llx\n", tag, pages[i], pte);
-            if (!(pte & 1))
-                continue;
-            IOMemoryDescriptor *d = IOMemoryDescriptor::withPhysicalAddress(pte & 0x7ffffff000ULL, 4096, kIODirectionIn);
-            if (d == nullptr)
-                continue;
-            IOMemoryMap *pm = d->map();
-            if (pm != nullptr) {
-                volatile uint32_t *px = (volatile uint32_t *)pm->getVirtualAddress();
-                IOLog("NullMoth DISP[%s] GGTT[%u] page px[0]=%08x px[256]=%08x px[512]=%08x px[1023]=%08x\n", tag, pages[i],
-                      px[0], px[256], px[512], px[1023]);
-                pm->release();
-            }
-            d->release();
         }
     }
     m->release();
@@ -268,8 +255,8 @@ void NMXGPU::attachNow()
     }
     nmx_marker_write(true);
     {
-        /* diagnostic build: DRM driver/KMS/atomic messages on by default (boot-arg nmxdrm=<mask>, 0 = off) */
-        uint32_t dbg = 0x16;
+        /* diagnostic build: DRM debug messages are opt-in (boot-arg nmxdrm=<mask>, e.g. 22 = driver+KMS+atomic) */
+        uint32_t dbg = 0;
         PE_parse_boot_argn("nmxdrm", &dbg, sizeof(dbg));
         __drm_debug = dbg;
     }
