@@ -36,6 +36,12 @@ if [ -n "$GS" ]; then
 else
     echo "ERROR: gem/i915_gem_stolen.c not found"; exit 1
 fi
+GV=$(find "$K/drm-kmod" -path '*i915/display/intel_display_driver.c' | head -1)
+if [ -n "$GV" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_novga.py "$GV" || { echo "ERROR: VGA knob patch failed"; exit 1; }
+else
+    echo "ERROR: display/intel_display_driver.c not found"; exit 1
+fi
 ${NMX_PY:-/opt/homebrew/bin/python3} srclist.py "$K/drm-kmod" amd.flags i915 2>/dev/null > srcs-i915.all
 : > srcs-i915.txt
 while read -r f; do

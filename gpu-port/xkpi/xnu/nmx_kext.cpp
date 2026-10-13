@@ -203,6 +203,13 @@ static void nmx_marker_write(bool on)
 /* read-only snapshot of the display engine (eDP panel power, backlight, pipe A, plane 1, DDI A, power wells) for black-screen
    diagnosis; reads only, safe at any time the device is powered */
 extern "C" unsigned long __drm_debug;
+/* boot-arg nmxnovga=1: i915 leaves the legacy VGA plane alone (see patch_i915_novga.py) */
+extern "C" int nmx_novga(void)
+{
+    int v = 0;
+    return PE_parse_boot_argn("nmxnovga", &v, sizeof(v)) && v != 0;
+}
+
 
 static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
 {
@@ -264,6 +271,11 @@ static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
         }
         ap->release();
     }
+
+    /* PCI config space of the GPU: the log of two moments shows whether anything in it changed */
+    for (unsigned off = 0; off < 0x100; off += 16)
+        IOLog("NullMoth DISP[%s] PCICFG[%02x] %08x %08x %08x %08x\n", tag, off, pci->configRead32(off),
+              pci->configRead32(off + 4), pci->configRead32(off + 8), pci->configRead32(off + 12));
 
     /* which framebuffer drivers macOS has right now */
     OSDictionary *match = IOService::serviceMatching("IOFramebuffer");
