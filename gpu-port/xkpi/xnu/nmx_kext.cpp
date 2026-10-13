@@ -202,6 +202,8 @@ static void nmx_marker_write(bool on)
 
 /* read-only snapshot of the display engine (eDP panel power, backlight, pipe A, plane 1, DDI A, power wells) for black-screen
    diagnosis; reads only, safe at any time the device is powered */
+extern "C" unsigned long __drm_debug;
+
 static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
 {
     IOMemoryMap *m = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
@@ -217,9 +219,34 @@ static void nmx_dump_display(IOPCIDevice *pci, const char *tag)
         { "TRANS_CLK_SEL_A", 0x46140 }, { "DDI_BUF_CTL_A", 0x64000 }, { "DP_TP_CTL_A", 0x64040 },
         { "PLANE_CTL_1_A", 0x70180 }, { "PLANE_SURF_1_A", 0x7019c }, { "CDCLK_CTL", 0x46000 },
         { "PWR_WELL_CTL1", 0x45400 }, { "PWR_WELL_CTL2", 0x45404 }, { "DC_STATE_EN", 0x45504 },
+        { "PLANE_STRIDE_1_A", 0x70188 }, { "PLANE_SIZE_1_A", 0x70190 }, { "PLANE_OFFSET_1_A", 0x701a4 },
+        { "PSR1_CTL_A", 0x60800 }, { "PSR2_CTL_A", 0x60900 },
     };
     for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
         IOLog("NullMoth DISP[%s] %s=0x%08x\n", tag, regs[i].n, r[regs[i].o / 4]);
+    /* the firmware framebuffer is scanned out through the GGTT: log a few page-table entries and the first pixels of the
+       pages they point at, to tell "the screen is blank" from "the plane no longer reads the framebuffer" */
+    if (m->getLength() >= 0x800000 + 8 * 4001) {
+        volatile uint64_t *gsm = (volatile uint64_t *)((uintptr_t)r + 0x800000);
+        static const uint32_t pages[] = { 0, 1, 100, 1000, 2000, 3999, 4000 };
+        for (unsigned i = 0; i < sizeof(pages) / sizeof(pages[0]); i++) {
+            uint64_t pte = gsm[pages[i]];
+            IOLog("NullMoth DISP[%s] GGTT[%u]=0x%016llx\n", tag, pages[i], pte);
+            if (!(pte & 1))
+                continue;
+            IOMemoryDescriptor *d = IOMemoryDescriptor::withPhysicalAddress(pte & 0x7ffffff000ULL, 4096, kIODirectionIn);
+            if (d == nullptr)
+                continue;
+            IOMemoryMap *pm = d->map();
+            if (pm != nullptr) {
+                volatile uint32_t *px = (volatile uint32_t *)pm->getVirtualAddress();
+                IOLog("NullMoth DISP[%s] GGTT[%u] page px[0]=%08x px[256]=%08x px[512]=%08x px[1023]=%08x\n", tag, pages[i],
+                      px[0], px[256], px[512], px[1023]);
+                pm->release();
+            }
+            d->release();
+        }
+    }
     m->release();
 }
 
@@ -240,6 +267,12 @@ void NMXGPU::attachNow()
         return;
     }
     nmx_marker_write(true);
+    {
+        /* diagnostic build: DRM driver/KMS/atomic messages on by default (boot-arg nmxdrm=<mask>, 0 = off) */
+        uint32_t dbg = 0x16;
+        PE_parse_boot_argn("nmxdrm", &dbg, sizeof(dbg));
+        __drm_debug = dbg;
+    }
     nmx_dump_display(pci_, "before-attach");
     dev_ = nmx_port_attach(pci_);
     if (dev_ == nullptr) {
