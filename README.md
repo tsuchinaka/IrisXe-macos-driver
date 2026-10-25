@@ -15,6 +15,12 @@ kernel-port design, the Metal plugin and the shader translator come from NullMot
 > **Experimental.** It runs daily on one machine (below), but it is a kernel driver for the GPU that drives your
 > screen. A bad build can leave the screen black or panic the Mac. Keep a way back (see [Safety](#safety)).
 
+
+
+Support me on [meacoffee.com/zep245](https://buymeacoffee.com/zep245)
+
+
+
 ## Tested machine
 
 | | |
