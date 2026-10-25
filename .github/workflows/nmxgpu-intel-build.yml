@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-14, macos-15]
+        runner: [macos-15]   # one runner: half the Actions minutes (10-19)
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     steps:
@@ -36,6 +36,63 @@ jobs:
           FREEBSD_REF: ${{ inputs.freebsd_ref }}
           NMX_NO_XE: ${{ inputs.no_xe }}
         run: bash gpu-port/xkpi/ci-build-intel.sh "$RUNNER_TEMP/nmx"
+
+      # b97: the Metal plugin (plugin/, one translation unit) built here too, as build/build_plugin.sh does on the
+      # build Mac. A failure here does not fail the kext build; the plugin lands in out/NVMTLDriver.bundle.
+      - name: Build NVMTLDriver (Metal plugin)
+        if: always()
+        continue-on-error: true
+        run: |
+          set -e
+          O="$RUNNER_TEMP/nmx/out"; mkdir -p "$O" "$RUNNER_TEMP/nmx/ci"
+          git clone -q --depth 1 https://github.com/KhronosGroup/Vulkan-Headers "$RUNNER_TEMP/vkh"
+          cd plugin
+          B="$O/NVMTLDriver.bundle/Contents/MacOS"; mkdir -p "$B"
+          xcrun clang -arch x86_64 -bundle -fobjc-arc -O1 -mmacosx-version-min=14.0 -Wno-protocol -Wno-incomplete-implementation \
+            -I"$RUNNER_TEMP/vkh/include" -o "$B/NVMTLDriver" NVMTLDevice.m \
+            -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework QuartzCore \
+            2> "$RUNNER_TEMP/nmx/ci/NVMTLDriver.err" || { grep -A3 ': error:' "$RUNNER_TEMP/nmx/ci/NVMTLDriver.err" | head -60; exit 1; }
+          codesign -f -s - "$B/NVMTLDriver"
+          echo "NVMTLDriver: $(stat -f %z "$B/NVMTLDriver") bytes, uuid $(otool -l "$B/NVMTLDriver" | awk '/uuid/{print $2; exit}')"
+          echo "### NVMTLDriver built ($(stat -f %z "$B/NVMTLDriver") bytes)" >> "$GITHUB_STEP_SUMMARY"
+
+      # b155: the shader translator (Rust) built here too, so a translator fix needs no Mesa build. It lands in
+      # out/nvmtl/libnvmtl_translate.dylib - install with tools/macos-helpers/nmx-xlate-update.sh.
+      - name: Build shader translator (libnvmtl_translate.dylib)
+        if: always()
+        continue-on-error: true
+        run: |
+          set -e
+          command -v cargo >/dev/null || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null; . "$HOME/.cargo/env"; }
+          O="$RUNNER_TEMP/nmx/out/nvmtl"; mkdir -p "$O" "$RUNNER_TEMP/nmx/ci"
+          # b156: the runners are Apple Silicon - build for x86_64 explicitly (b155's arm64 dylib could not load:
+          # "incompatible architecture", WindowServer had no translator and restarted in a loop at login)
+          rustup target add x86_64-apple-darwin
+          MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --target x86_64-apple-darwin \
+            --manifest-path translator/wrapper/Cargo.toml --target-dir "$RUNNER_TEMP/xlate-target" \
+            > "$RUNNER_TEMP/nmx/ci/cargo.log" 2>&1 || { grep -E "^error" -A6 "$RUNNER_TEMP/nmx/ci/cargo.log" | head -60; exit 1; }
+          cp "$RUNNER_TEMP/xlate-target/x86_64-apple-darwin/release/libnvmtl_translate.dylib" "$O/"
+          lipo -archs "$O/libnvmtl_translate.dylib" | grep -qx x86_64 || { echo "NOT x86_64: $(lipo -archs "$O/libnvmtl_translate.dylib")"; exit 1; }
+          install_name_tool -id @rpath/libnvmtl_translate.dylib "$O/libnvmtl_translate.dylib"
+          strip -S "$O/libnvmtl_translate.dylib"; codesign -f -s - "$O/libnvmtl_translate.dylib"
+          cp tools/macos-helpers/nmx-xlate-update.sh "$O/"
+          echo "### libnvmtl_translate.dylib built ($(stat -f %z "$O/libnvmtl_translate.dylib") bytes)" >> "$GITHUB_STEP_SUMMARY"
+
+      # b104 (Phase 4): the Metal test programs, so app-path tests need no Xcode on the Mac. The plugin always gives
+      # these names a device. mtlwindow = a window with a CAMetalLayer: the same path an app's frames take to the screen.
+      - name: Build Metal test tools (mtlprobe, mtldraw, mtlwindow)
+        if: always()
+        continue-on-error: true
+        run: |
+          set -e
+          T="$RUNNER_TEMP/nmx/out/metal-tests"; mkdir -p "$T"
+          M="xcrun clang -arch x86_64 -fobjc-arc -O1 -mmacosx-version-min=14.0"
+          $M tools/metal/mtlprobe.m  -framework Foundation -framework Metal -o "$T/mtlprobe"
+          $M tools/metal/mtldraw.m   -framework Foundation -framework Metal -framework CoreGraphics -framework ImageIO -o "$T/mtldraw"
+          $M tools/metal/mtlwindow.m -framework Foundation -framework AppKit -framework Metal -framework QuartzCore -o "$T/mtlwindow"
+          for f in "$T"/*; do codesign -f -s - "$f"; done
+          cp tools/macos-helpers/nmx-app-gpu.sh "$T/"
+          echo "### Metal test tools built: $(ls "$T" | tr '\n' ' ')" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload logs and kext
         if: always()

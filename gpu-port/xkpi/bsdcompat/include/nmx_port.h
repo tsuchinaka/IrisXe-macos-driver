@@ -29,6 +29,29 @@ void nmx_fb_before_attach(void);
 int nmx_fb_open(void *dev, struct nmx_fb_info *out);
 void nmx_fb_close(void *dev);
 int nmx_fb_power(void *dev, int on);
+/* desktop size w x h (<= native) shown full-screen by the panel fitter; 0 x 0 = native */
+int nmx_fb_set_size(void *dev, uint32_t w, uint32_t h);
+/* b89: aperture-backed buffers for the accelerator ("VRAM"); 0 = ok, phys/kva of one contiguous run */
+int nmx_fb_vram_alloc(void *dev, uint64_t size, uint64_t *phys, void **kva, void **handle);
+void nmx_fb_vram_free(void *handle);
+/* b94: hardware cursor on the display engine's cursor plane. init: two dim x dim ARGB8888 images (premultiplied),
+   CPU-writable through kva[0]/kva[1]; 0 = ok (tested on the outputs). apply: show image 'img' (0/1) with its top-left
+   at x,y in desktop coordinates, or hide it (visible 0); remembered and put back after every mode set. */
+int nmx_fb_cursor_init(void *dev, uint32_t *dim, void **kva0, void **kva1);
+int nmx_fb_cursor_apply(void *dev, int img, int32_t x, int32_t y, int visible);
+/* b125 (R2): double-buffered scan-out. back: the CPU view of the buffer not on the panel (desktop size w x h);
+   commit: flip the primary plane to it at the next vblank (blocking); home: back to the IOFramebuffer's buffer. 0 = ok */
+int nmx_fb_flip_back(void *dev, void **kva, uint32_t *pitch, uint32_t *w, uint32_t *h);
+/* b164: boot screen hand-over - the first mode set waits for WindowServer (nmx_fb_go); the kext sets the knob first */
+int nmx_fb_go(void *dev, const char *why);
+int nmx_fb_deferred(void *dev);      /* 1 = still showing the firmware screen */
+int nmx_fb_go_on_flip(void *dev, const char *why);  /* b174: hand over at the next flip */
+int nmx_fb_back_content(void *dev);  /* b169: lit pixels of 64 in the newest held frame, -1 = none */
+extern int nmx_fb_defer_wanted;
+extern int nmx_fb_ext_wanted;          /* b180: external outputs mirror the panel; -nmxnoext = 0 */
+extern int nmx_fb_psr_wanted;          /* b170: PSR once frames flip; -nmxnopsr = 0 */
+int nmx_fb_flip_commit(void *dev);
+int nmx_fb_flip_home(void *dev);
 #ifdef __cplusplus
 }
 #endif

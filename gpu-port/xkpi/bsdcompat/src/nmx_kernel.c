@@ -29,6 +29,7 @@
  * ml_get_max_cpus are not among them */
 extern boolean_t ml_at_interrupt_context(void);
 extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
+extern boolean_t ml_get_interrupts_enabled(void);
 extern int cpu_number(void);
 extern int nmx_xnu_ncpus(void);
 /* exported to kexts but not declared in the SDK; the xnu proc_t is used only as an opaque key */
@@ -82,6 +83,34 @@ struct nmx_thread_rec {
 static struct nmx_thread_rec *nmx_threads[NMX_THREAD_BUCKETS];
 static lck_spin_t *nmx_thread_lock;
 static volatile int nmx_thread_count;
+/*
+ * b120: fast path for curthread. Every LinuxKPI lock, RCU read section and critical section looked the calling
+ * thread up in the hash table under ONE global spin lock (nmx_thread_lock) - per buffer, per submission: with
+ * WindowServer listing ~600 buffers in each of ~170 GPU submissions a second, the kernel spent ~1 ms per submission,
+ * much of it here (nmx-wsprof / nmx-execbuf, 10-21). Each CPU now remembers the last record it resolved; a hit needs
+ * no lock. Records are type-stable: a dropped record goes on a free list (td_xnu cleared) instead of back to the
+ * allocator, so a stale cache entry always points at a live nmx_thread_rec and the td_xnu check rejects it.
+ * Boot-arg -nmxnotcache turns the cache off (read by the kext, xnu/nmx_kext.cpp).
+ */
+static struct nmx_thread_rec *volatile nmx_tcache[MAXCPU];
+static struct nmx_thread_rec *nmx_thread_free;     /* under nmx_thread_lock; td.td_xnu == NULL */
+int nmx_tcache_disable;   /* set by the kext before the port starts (boot-arg -nmxnotcache) */
+static inline int nmx_tcache_on(void)
+{
+    return !nmx_tcache_disable;
+}
+static inline struct nmx_thread_rec *nmx_tcache_hit(thread_t xt)
+{
+    if (!nmx_tcache_on())
+        return NULL;
+    struct nmx_thread_rec *r = nmx_tcache[(unsigned)cpu_number() & (MAXCPU - 1)];
+    return (r != NULL && r->td.td_xnu == xt) ? r : NULL;
+}
+static inline void nmx_tcache_put(struct nmx_thread_rec *r)
+{
+    if (nmx_tcache_on())
+        nmx_tcache[(unsigned)cpu_number() & (MAXCPU - 1)] = r;
+}
 
 #define NMX_PROC_BUCKETS 64
 struct nmx_proc_rec {
@@ -151,13 +180,28 @@ static struct thread *nmx_thread_get(int transient, int *created)
 {
     thread_t xt = current_thread();
     *created = 0;
-    lck_spin_lock(nmx_thread_lock);
-    struct nmx_thread_rec *r = nmx_thread_find(xt);
-    lck_spin_unlock(nmx_thread_lock);
+    struct nmx_thread_rec *r = nmx_tcache_hit(xt);
     if (r)
         return &r->td;
+    lck_spin_lock(nmx_thread_lock);
+    r = nmx_thread_find(xt);
+    lck_spin_unlock(nmx_thread_lock);
+    if (r) {
+        nmx_tcache_put(r);
+        return &r->td;
+    }
 
-    struct nmx_thread_rec *nr = IOMallocZero(sizeof(*nr));
+    struct nmx_thread_rec *nr = NULL;
+    lck_spin_lock(nmx_thread_lock);
+    if (nmx_thread_free) {
+        nr = nmx_thread_free;
+        nmx_thread_free = nr->next;
+    }
+    lck_spin_unlock(nmx_thread_lock);
+    if (nr)
+        bzero(nr, sizeof(*nr));
+    else
+        nr = IOMallocZero(sizeof(*nr));
     if (nr == NULL)
         panic("NullMoth xkpi: no memory for a thread record");
     nr->td.td_xnu = xt;
@@ -178,9 +222,13 @@ static struct thread *nmx_thread_get(int transient, int *created)
         nr = NULL;
         *created = 1;
     }
+    if (nr) {               /* lost the race: keep it for the next one */
+        nr->td.td_xnu = NULL;
+        nr->next = nmx_thread_free;
+        nmx_thread_free = nr;
+    }
     lck_spin_unlock(nmx_thread_lock);
-    if (nr)
-        IOFree(nr, sizeof(*nr));
+    nmx_tcache_put(r);
     return &r->td;
 }
 
@@ -204,18 +252,21 @@ static void nmx_thread_drop_current(void)
             found = *pp;
             *pp = found->next;
             nmx_thread_count--;
+            /* b120: type-stable - cleared and kept, never freed while the cache may still point at it */
+            found->td.td_xnu = NULL;
+            found->next = nmx_thread_free;
+            nmx_thread_free = found;
             break;
         }
     }
     lck_spin_unlock(nmx_thread_lock);
-    if (found)
-        IOFree(found, sizeof(*found));
 }
 
 /*
  * System-call entry and exit for the device-node glue: enter returns non-zero when it created the record, and leave
  * frees it again (after LinuxKPI's per-thread state is released through the hook), unless the thread is one of ours.
  */
+static void nmx_critical_check_leave(struct thread *td);
 void (*nmx_thread_release_hook)(struct thread *td);
 int nmx_thread_enter(void)
 {
@@ -226,10 +277,11 @@ int nmx_thread_enter(void)
 
 void nmx_thread_leave(int created)
 {
-    if (!created)
-        return;
     int c2;
     struct thread *td = nmx_thread_get(1, &c2);
+    nmx_critical_check_leave(td);
+    if (!created)
+        return;
     if (nmx_thread_release_hook && td->td_lkpi_task)
         nmx_thread_release_hook(td);
     nmx_thread_drop_current();
@@ -255,29 +307,93 @@ struct thread *tdfind(lwpid_t tid, pid_t pid)
 
 /*
  * Critical sections: xnu does not let kexts disable preemption, so a critical section runs with interrupts off on
- * this CPU, which also rules out preemption and migration. Nesting is counted per CPU; the interrupt state from the
- * outermost entry is restored at the outermost exit. LinuxKPI's critical sections are short and never sleep.
+ * this CPU, which also rules out preemption and migration. The outermost entry's interrupt state is restored at the
+ * outermost exit.
+ *
+ * 10-18: the nesting count and the saved state are kept PER THREAD (they were per CPU). A section that blocks inside
+ * (a lock that sleeps, a wait) wakes on another CPU; with per-CPU counts its exit decremented the wrong CPU's count, so
+ * neither count ever returned to 0: the thread went on - back to user space, into exit - with interrupts disabled, and
+ * other threads on both CPUs inherited broken counts. That is the "unsafe thread_call_cancel_wait" panic in workq_exit
+ * when Brave (and earlier mtlwindow) quit: xnu found the exiting thread running with interrupts off. The thread record
+ * is looked up before interrupts go off (the first lookup may allocate).
  */
-static struct { int nest; boolean_t saved; } nmx_crit[MAXCPU];
+static int nmx_crit_leaks;
+static struct { int nest; boolean_t saved; } nmx_crit[MAXCPU];   /* fallback for threads without a record */
+
+/* the calling thread's record, or NULL - never allocates (callers may already run with interrupts off) */
+static struct thread *nmx_thread_lookup(void)
+{
+    thread_t xt = current_thread();
+    struct nmx_thread_rec *r = nmx_tcache_hit(xt);
+    if (r)
+        return &r->td;
+    lck_spin_lock(nmx_thread_lock);
+    r = nmx_thread_find(xt);
+    lck_spin_unlock(nmx_thread_lock);
+    if (r)
+        nmx_tcache_put(r);
+    return r ? &r->td : NULL;
+}
 
 void nmx_critical_enter(void)
 {
+    struct thread *td = ml_get_interrupts_enabled() ? curthread : nmx_thread_lookup();
     boolean_t was = ml_set_interrupts_enabled(FALSE);
-    int c = cpu_number();
-    if (nmx_crit[c].nest++ == 0)
-        nmx_crit[c].saved = was;
+    if (td == NULL) {   /* no record and interrupts already off: per-CPU, as before (cannot migrate either way) */
+        int c = cpu_number();
+        if (nmx_crit[c].nest++ == 0)
+            nmx_crit[c].saved = was;
+        return;
+    }
+    if (td->td_critnest++ == 0)
+        td->td_crit_saved = was;
 }
 
 void nmx_critical_exit(void)
 {
-    int c = cpu_number();
-    if (--nmx_crit[c].nest == 0)
-        ml_set_interrupts_enabled(nmx_crit[c].saved);
+    struct thread *td = nmx_thread_lookup();
+    if (td == NULL || td->td_critnest <= 0) {
+        int c = cpu_number();
+        if (nmx_crit[c].nest > 0) {
+            if (--nmx_crit[c].nest == 0)
+                ml_set_interrupts_enabled(nmx_crit[c].saved);
+            return;
+        }
+        if (nmx_crit_leaks++ < 8)
+            printf("NullMoth xkpi: critical_exit without critical_enter (thread %d); interrupts left as they are\n",
+                   td ? td->td_tid : -1);
+        return;
+    }
+    if (--td->td_critnest == 0)
+        ml_set_interrupts_enabled(td->td_crit_saved);
+}
+
+/* system-call exit: a critical section must never outlive the call; if one did, close it and say so */
+static void nmx_critical_check_leave(struct thread *td)
+{
+    int nest = td ? td->td_critnest : 0;
+    if (nest != 0 || !ml_get_interrupts_enabled()) {
+        if (nmx_crit_leaks++ < 8)
+            printf("NullMoth xkpi: a device call returned with interrupts %s (critical nesting %d) - repaired\n",
+                   ml_get_interrupts_enabled() ? "on" : "OFF", nest);
+        if (td)
+            td->td_critnest = 0;
+        ml_set_interrupts_enabled(TRUE);
+    }
+}
+
+/* called by the device-node glue (xnu/nmx_devfs.cpp) as each entry point returns to the caller */
+void nmx_critical_syscall_check(void)
+{
+    nmx_critical_check_leave(nmx_thread_lookup());
 }
 
 int nmx_in_critical(void)
 {
-    return (ml_at_interrupt_context() || nmx_crit[cpu_number()].nest > 0) ? 1 : 0;
+    if (ml_at_interrupt_context() || nmx_crit[cpu_number()].nest > 0)
+        return 1;
+    struct thread *td = nmx_thread_lookup();
+    return (td && td->td_critnest > 0) ? 1 : 0;
 }
 
 int nmx_curcpu(void)
@@ -486,6 +602,9 @@ void nmx_kernel_fini(void)
             while (r) { struct nmx_thread_rec *n = r->next; IOFree(r, sizeof(*r)); r = n; }
             nmx_threads[b] = NULL;
         }
+        for (unsigned c = 0; c < MAXCPU; c++)
+            nmx_tcache[c] = NULL;
+        while (nmx_thread_free) { struct nmx_thread_rec *n = nmx_thread_free->next; IOFree(nmx_thread_free, sizeof(*nmx_thread_free)); nmx_thread_free = n; }
         for (unsigned b = 0; b < NMX_PROC_BUCKETS; b++) {
             struct nmx_proc_rec *r = nmx_procs[b];
             while (r) { struct nmx_proc_rec *n = r->next; IOFree(r, sizeof(*r)); r = n; }

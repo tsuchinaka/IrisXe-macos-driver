@@ -1,208 +1,179 @@
-# Intel Iris Xe graphics driver for macOS 14 Sonoma (experimental)
+# Intel Iris Xe graphics driver for macOS (experimental)
 
-An experimental port of Intel's Linux/FreeBSD **i915** graphics driver to macOS 14 Sonoma on x86_64 (Hackintosh /
-OpenCore), aimed at 11th-gen **Iris Xe (Tiger Lake, `8086:9A49`)**. The goal is a kernel driver, a Vulkan driver and
-a Metal device for the Intel GPU, where macOS has no native support for it.
+An experimental GPU driver that gives an 11th-gen **Intel Iris Xe (Tiger Lake, `8086:9A49`)** a working display and
+**Metal acceleration on macOS Sequoia** (Hackintosh / OpenCore, x86_64). macOS has never supported this GPU: Apple's
+last Intel graphics drivers stop at Ice Lake.
 
-This repository is a fork of [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver). All of the
-GPU-port design and most of the code is NullMoth Systems' work: the NVIDIA Metal driver, plus the AMD/Intel kernel port
-in `gpu-port/` that this fork builds on. This fork's contribution so far is getting the Intel (i915) path to build for
-Sonoma and documenting it. The original NVIDIA README is kept at [`docs/README-NVIDIA.md`](docs/README-NVIDIA.md).
+It is built on Intel's own open-source Linux display driver (**i915**, through FreeBSD's `drm-kmod`) running inside the
+macOS kernel, Mesa's **ANV** Vulkan driver, and a Metal-to-Vulkan layer that macOS loads as its Metal driver.
 
-> **Status: it builds. It has never been loaded on hardware.**
-> Nothing here has been run on a real Iris Xe machine yet. Loading a GPU driver on the GPU that drives your screen can
-> black out the display or panic the kernel. Read [Safety](#safety) before you try it, and do not use a machine you
-> cannot recover.
+This repository is a fork of [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver). The
+kernel-port design, the Metal plugin and the shader translator come from NullMoth Systems; this fork turned the Intel
+(i915) path into a working driver for Iris Xe on Sequoia. The original NVIDIA README is kept at
+[`docs/README-NVIDIA.md`](docs/README-NVIDIA.md). The day-by-day engineering log is [`DESIGN.md`](DESIGN.md).
 
-## Where it stands
+> **Experimental.** It runs daily on one machine (below), but it is a kernel driver for the GPU that drives your
+> screen. A bad build can leave the screen black or panic the Mac. Keep a way back (see [Safety](#safety)).
 
-| Stage | State |
+## Tested machine
+
+| | |
 |---|---|
-| Compiles on macOS 14 runner, Xcode 15.4, SDK 14.5 (x86_64) | **Done.** 900 core + 274 i915 + 75 runtime sources, 0 failures |
-| Links `NMXGPU.kext` (13.4 MB, Mach-O x86_64 kext bundle) | **Done.** 0 internally-missing symbols; 544 undefined, all kernel KPI |
-| Symbols resolve against Sonoma's real kernel collection | Not checked |
-| Kext loads on Sonoma 14.8.9, all symbols resolve, firmware found, boot guard works | **Done** (hardware test, 2026-10-13) |
-| i915 attaches headless (`nmxintel=1 nmxnofb=1`) | Probe succeeds; GGTT, stolen memory and display registers verified intact. Screen still black; macOS fills the framebuffer with black after attach. Suspect the IOKit side (power-management / claim on the PCI device); boot-arg experiments nmxnopm / nmxnoclaim added; retest pending |
-| DRM nodes (`NMDRM`) and Vulkan through ANV on the real device | Not tested |
-| `NMXAccel` accelerator shows a Metal device on Sonoma | Not tested. Most likely stage to need code changes |
-| Display output through the driver | Not tested |
+| Laptop | Xiaomi Mi Notebook Pro, Core i5-11300H, Iris Xe `8086:9A49`, 1920x1080 eDP panel |
+| macOS | Sequoia 15.8.1, SMBIOS `MacBookPro16,2`, OpenCore |
+| Desktop | 1680x1050 (scaled), accelerated |
 
-The upstream project is written and tested for macOS 15. Sonoma is a port of a port: treat every row marked "not
-tested" as unknown.
+Other Tiger Lake Iris Xe / UHD laptops may work; nothing else has been tested. Tahoe (macOS 26) is planned.
+
+## What works
+
+| Area | State |
+|---|---|
+| Display | Built-in panel driven by i915: mode set, hardware cursor, brightness (slider and keys), no flicker |
+| Boot | Apple logo kept on screen until the accelerated desktop is ready (no black gap, no second logo) |
+| Acceleration | WindowServer composites with Metal on the Iris Xe; frames reach the panel by page flip at vblank |
+| Metal apps | Through the Metal plugin, per app allow-list (`/Library/GPUBundles/nvmtl-allow.txt`); reports Metal 3 |
+| Browsers | Brave (Skia Graphite) and Safari: text, scrolling, video |
+| Camera apps | Photo Booth (incl. Effects), QuickTime, browser cameras |
+| Power | GPU idles in RC6 (0 MHz when idle), clock governor 300-1300 MHz, panel self refresh (PSR1) once accelerated |
+| Sleep / wake | Lid, Apple menu and display sleep; acceleration and PSR come back after wake |
+| About This Mac | "Intel Iris Xe Graphics 1536 MB" (shared memory, as Apple shows for Intel GPUs) |
+
+Measured on the tested machine, idle desktop on battery at 11 % brightness: about **10.7 W before PSR, 5.2 W with it**.
+
+### Known issues
+
+- Photo Booth: the delete badge on photos in the strip draws as a black square.
+- After a restart the desktop shows ~6 s of black with the pointer before the lock screen: macOS's display server is
+  restarted once, accelerated, because the driver loads after it starts.
+- External displays (HDMI / USB-C): mirroring of the laptop screen only, not yet tested on hardware; no extended desktop.
+- A Metal app that is not on the allow-list gets no GPU device.
 
 ## Architecture
 
-The idea: don't write a GPU driver from scratch. Run Intel's existing open-source Linux driver as unmodified as possible
-inside the macOS kernel, by supplying the kernel services it expects, then put a Metal front end on top.
-
 ```
- Metal app
-    │
-    ▼
- Metal plugin  (plugin/, loaded by the OS from /Library/GPUBundles)
-    │  detects an Intel accelerator and loads the Vulkan driver below
-    ▼
- Mesa ANV  (Intel Vulkan)  +  libdrm for Darwin        gpu-port/patches/
-    │  ioctls on /dev/dri/renderD*
-    ▼
- ─────────────────────────── user space / kernel boundary ───────────────────────────
-    │
-    ├─ NMDRM.kext      DRM device nodes (/dev/dri/*) for libdrm              kexts/NMDRM
-    ├─ NMXAccel.kext   IOAccelerator that WindowServer / IOSurface use       kexts/NVRM/accel (-DNMX_ACCEL)
-    ├─ NMIntelFB.kext  optional: take over the panel the firmware already lit   kexts/NMIntelFB
-    │
-    └─ NMXGPU.kext     the GPU kernel driver (this is what the CI builds)    gpu-port/xkpi
-          │
-          ├─ i915           Intel GPU + display driver (Gen9 … Arrow Lake), from FreeBSD drm-kmod
-          ├─ DRM core, TTM, dma-fence                                       from drm-kmod
-          ├─ LinuxKPI       Linux kernel API emulation                      from FreeBSD sys/compat/linuxkpi
-          ├─ bsdcompat/     FreeBSD kernel API (newbus, busdma, sysctl, locks, malloc …) implemented on xnu
-          ├─ override/      the port's own replacements for upstream files (PCI, devres, DRM glue, display bridge)
-          └─ xnu/           IOKit glue: the NMXGPU IOService, PCI, DMA, devfs, framebuffer
-                │
-                ▼
-          macOS kernel (IOKit, IOPCIFamily, IOACPIFamily, IOGraphicsFamily) ──► Iris Xe GPU
+ Metal app / WindowServer
+    |
+    v
+ NVMTLDriver.bundle   Metal device on top of Vulkan       plugin/        (/Library/GPUBundles)
+    |  shaders: Apple AIR -> SPIR-V                        translator/    (libnvmtl_translate.dylib)
+    v
+ Mesa ANV (Intel Vulkan) + libdrm for Darwin                gpu-port/patches/  (mesa-anv-build.yml)
+    |  ioctls on /dev/dri/renderD*
+ ---------------------------- user space / kernel ----------------------------
+    |
+    +- NMXAccel     IOAccelerator: Metal command submission, IOSurfaces, display pipe   kexts/NVRM/accel
+    +- NMDRM        DRM device nodes for libdrm                                          kexts/NMDRM
+    +- NMXGPU.kext  i915 + DRM core + LinuxKPI on xnu; NMXGPUFB framebuffer,             gpu-port/xkpi
+                    page flips, cursor, backlight, power (RC6, PSR)
+                         |
+                         v
+                    macOS kernel (IOKit, IOPCIFamily, IOGraphicsFamily)  ->  Iris Xe
 ```
 
-For Tiger Lake only the **i915** driver is needed. Intel's newer `xe` driver (Lunar Lake and later) is excluded
-from this build (`NMX_NO_XE=1`).
-
-### How each layer is built
-
-| Layer | What it is | Origin |
-|---|---|---|
-| `i915`, DRM core, TTM | Intel and Linux graphics code, compiled as-is (900 core + 274 i915 sources) | FreeBSD `drm-kmod` |
-| LinuxKPI | Linux kernel API shims, so Linux driver code compiles unchanged | FreeBSD `freebsd-src` |
-| `bsdcompat/` | The FreeBSD kernel API LinuxKPI sits on, reimplemented on xnu | NullMoth |
-| `override/` | Files that replace upstream ones, plus small Python patch scripts (`fork_*.py`) that rewrite upstream code for macOS | NullMoth |
-| `xnu/` | The IOKit class `NMXGPU` (PCI matching, interrupts, DMA, `/dev` nodes, display bridge) | NullMoth |
-
-Because most of the code is fetched from upstream at build time rather than stored here, **the upstream versions matter**
-(see [Pinned upstream versions](#pinned-upstream-versions)).
-
-### How the driver is switched on
-
-The kext matches every Intel and AMD display-class PCI function (`IOPCIClassMatch 0x03000000`), but its `probe()`
-**declines every device unless you opt in**, so installing it does nothing by itself:
-
-| Boot argument | Effect |
+| Layer | Origin |
 |---|---|
-| `nmxintel=1` | Opt the Intel GPU in (or set the `nullmoth-gpu` device property). Without it macOS keeps the device. |
-| `nmxnofb=1` | Attach headless: i915 and the accelerator start, but no display bridge is published and the panel is not re-lit by the driver. |
-| `-nvoff` | Park every NullMoth GPU driver for one boot (recovery). |
-| `-v` | Verbose boot, so `NullMoth GPU:` log lines are visible. |
-
-There is also a boot guard: the kext sets the NVRAM variable `nullmoth-gpu-attaching` during attach. If a later boot
-finds it still set (the attach never returned), the driver parks the GPU and logs why. Clear it with
-`nvram -d nullmoth-gpu-attaching` or an OpenCore NVRAM reset.
+| `i915`, DRM core, TTM | FreeBSD `drm-kmod`, compiled as-is (`NMX_NO_XE=1`: the newer `xe` driver is left out) |
+| LinuxKPI | FreeBSD `freebsd-src` |
+| `gpu-port/xkpi/bsdcompat/`, `override/`, `xnu/` | The FreeBSD kernel API on xnu, the port's replacements, the IOKit glue (NMXGPU, NMXGPUFB) |
+| `plugin/`, `translator/`, `kexts/` | Metal plugin, shader translator, accelerator and DRM nodes |
+| `tools/macos-helpers/` | Install, update and diagnostic scripts (`nmx-*.sh`) |
 
 ## Building
 
-### GitHub Actions (recommended)
+GitHub Actions (the machines Apple provides there have the right Xcode):
 
-1. Push this repository to your own GitHub repo.
-2. **Actions → "NMXGPU Intel (i915) kext build" → Run workflow.** Defaults: target `14.0`, xe off, upstream commits pinned.
-3. Open the run summary for per-stage results, then download the `nmxgpu-macos-14` artifact for `out/NMXGPU.kext` and
-   the full logs (`ci/logs.tgz`).
+1. **Actions -> "NMXGPU Intel (i915) kext build" -> Run workflow** (`nmxgpu-intel-build.yml`). It builds `NMXGPU.kext`,
+   the Metal plugin binary, the shader translator (`--target x86_64-apple-darwin`) and the Metal test tools. Download the
+   `nmxgpu-*` artifact.
+2. **"Mesa ANV + Metal plugin"** (`mesa-anv-build.yml`) builds Mesa ANV and the full `NVMTLDriver.bundle` including
+   `air-runtime/` (the shader reader). Needed once, and again only when Mesa changes.
 
-The workflow runs `gpu-port/xkpi/ci-build-intel.sh`, which fetches the upstream sources, then runs `all.sh`, `all-i915.sh`,
-`rt.sh` and `kext/build.sh`. It never stops at the first failure, so one run reports everything that is broken.
+Locally on a Mac with Xcode: `NMX_MIN_OS=14.0 gpu-port/xkpi/ci-build-intel.sh ~/nmx-build`.
 
-### On a Mac with Xcode
+Pinned upstream versions (bumping them means fixing the port):
+`freebsd/drm-kmod` `c16de0f9fa84f70b9551f69fde837a7f3a73c0e9`,
+`freebsd/freebsd-src` `b42793d4bcdf73475b77a26c9dbacd45f8876621`.
 
-```bash
-NMX_MIN_OS=14.0 gpu-port/xkpi/ci-build-intel.sh ~/nmx-build
-# result: ~/nmx-build/out/NMXGPU.kext, summary in ~/nmx-build/ci/summary.md
-```
+## Installing
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `NMX_MIN_OS` | `14.0` in CI | `-mmacosx-version-min` for objects and link |
-| `NMX_NO_XE` | `1` in CI | Leave the `xe` driver out |
-| `DRM_KMOD_REF` | pinned commit | drm-kmod branch, tag or commit |
-| `FREEBSD_REF` | pinned commit | freebsd-src branch, tag or commit |
+Requirements: OpenCore with SIP reduced and `SecureBootModel Disabled` (the kexts are unsigned), the Intel Tiger Lake
+firmware (`i915/tgl_dmc_*`, `tgl_guc_*`, `tgl_huc_*`, see `app/Resources/nullmoth-gpu-firmware.txt`) in
+`/Library/NullMoth/firmware/i915/`.
 
-### Pinned upstream versions
+1. Copy `NMXGPU.kext` (and the accelerator kexts) to `/Library/Extensions`, approve them in System Settings ->
+   Privacy & Security, and restart (macOS adds them to the auxiliary kext collection).
+2. Metal plugin: first time, the full bundle from the Mesa build into `/Library/GPUBundles/`; after that only the binary:
+   `sudo tools/macos-helpers/nmx-plugin-update.sh <new NVMTLDriver.bundle>` - it keeps `air-runtime/`. Shader
+   translator: `tools/macos-helpers/nmx-xlate-update.sh`.
+3. Acceleration at every boot: `sudo tools/macos-helpers/nmx-autoarm/install-autoarm.sh` (also installs the brightness
+   slider sync).
+4. Boot-args used on the tested machine:
+   ```
+   keepsyms=1 nmxintel=1 nmxaccel=1 -nmintelfboff nmxws=1 nmxcopyfwd=1 nmxautoarm=1 nmxmodern=1 nmxintelfb=1 -nmxnosnap
+   ```
+   (`nmxintel=1` opts the GPU in - without it the driver declines the device; `nmxws=1` + `nmxautoarm=1` turn on
+   accelerated WindowServer at boot.)
+5. OpenCore: `DeviceProperties` for `PciRoot(0x0)/Pci(0x2,0x0)`: `AAPL,ig-platform-id` = `0000499A`, `device-id` =
+   `499A0000`, `AAPL,slot-name` = `built-in`; WhateverGreen is not used. Kernel -> Block `com.apple.iokit.IONDRVSupport`
+   (Exclude) so the driver's framebuffer is display 0.
 
-The last known-good build used:
+## Switches
 
-- `freebsd/drm-kmod` `c16de0f9fa84f70b9551f69fde837a7f3a73c0e9`
-- `freebsd/freebsd-src` `b42793d4bcdf73475b77a26c9dbacd45f8876621` (`sys/compat/linuxkpi`, `sys/contrib/ck`, `sys/contrib/dev/acpica/include`)
+Boot-args (OpenCore `boot-args`):
 
-Tracking `master`/`main` broke the first build, because FreeBSD moved code the port depends on. If you bump these, expect
-to fix the port. The first build failed in three places:
+| Boot-arg | Effect |
+|---|---|
+| `-nvoff` | Park every NullMoth GPU driver for one boot (recovery) |
+| `-nmxnopsr` | No panel self refresh |
+| `-nmxnoext` | Never light external displays |
+| `-nmxnohold` / `-nmxnodefer` | Do not hold the Apple logo until the accelerated desktop / commit the screen at once |
+| `nmxgtawake=2` | Keep the GPU out of RC6 |
+| `nmxautoarm=2` / `3` | Acceleration helper: dry run / arm without restarting WindowServer |
 
-| Break | Cause | Fix in this fork |
-|---|---|---|
-| `call to undeclared function '__const_bitcount8'` (60 sources) | FreeBSD's `hweight*()` now needs compile-time popcount macros that `bsdcompat/include/sys/cdefs.h` lacked | Added `__const_bitcount8/16/32/64` to `cdefs.h` |
-| `use of undeclared identifier 'pci_lock'` in `linux_pci.c` | Upstream renamed these PCI globals to `lkpi_pci_*` and made them static; `override/src/linux_pci.c` still uses the old ones, which `linux_compat.c` defines | Added `extern` declarations in `linux_pci.c` |
-| `duplicate symbol '_kmod_info'` at link | `rt.sh` compiled the NPU kext's entry point into the shared `xnuobj/` that the GPU kext links | `rt.sh` and `kext/build.sh` exclude `nmx_npu_kext` |
+Files in `/Library/GPUBundles/` (read at run time, no rebuild):
+
+| File | Effect |
+|---|---|
+| `nvmtl-allow.txt` | Apps allowed to use the GPU, one `!Name` per line |
+| `nvmtl-ciflip` | Apps whose Core Image output is flipped (default: Photo Booth; an empty file turns it off) |
+| `nvmtl-standincopy` | Old copy mode for small image uploads (causes stale text - diagnostic only) |
+| `nmx-autoarm-slow` / `nmx-autoarm-fast` | Slower / faster acceleration helper timings |
+
+## Diagnostics
+
+| Script (`tools/macos-helpers/`) | Shows |
+|---|---|
+| `nmx-boottime.sh` | When each part of the boot happened (driver, screen, WindowServer, acceleration) |
+| `nmx-power.sh` | Idle power from the battery, GPU RC6 / clock state |
+| `nmx-wakecheck.sh` | What happened in the last sleeps and wakes |
+| `nmx-display.sh` | Outputs the driver sees (panel, HDMI, DisplayPort), their modes, hot-plug events |
+| `nmx-autoarm/nmx-autoarm-report.sh` | The acceleration helper's last boot |
+
+Driver log: `log show --last boot --predicate 'eventMessage contains "NullMoth"'`.
 
 ## Safety
 
-Read this before loading anything.
-
-- **The driver targets the GPU that probably drives your panel.** On a laptop, the built-in screen is wired to the
-  Iris Xe. Attach reads and initialises display hardware (DMC firmware, power wells) even with `nmxnofb=1`. A bug can
-  mean a black screen or a hard hang.
-- **Use a recovery path.** Keep OpenCore on a USB stick, know how to reset NVRAM, and have a second machine or SSH
-  access so you can read logs when the screen is dark. Make a full backup first.
-- **Start headless.** Always begin with `nmxintel=1 nmxnofb=1 -v`. Only try display output after every earlier stage works.
-- **The kext is unsigned.** Loading it on Sonoma needs SIP reduced and Apple Secure Boot off (`SecureBootModel Disabled`),
-  as in the upstream NVIDIA setup. Understand what that costs your machine's security first.
-- **Not a daily driver.** Do not install this on a machine you depend on.
-
-## Bring-up plan
-
-Move to the next stage only when the previous one passes. Full notes are in
-[`docs/INTEL-TIGERLAKE-SONOMA.md`](docs/INTEL-TIGERLAKE-SONOMA.md).
-
-1. **Validate the kext statically** on the Mac: check that its symbols resolve against Sonoma's kernel before it ever loads.
-2. **Attach, headless.** Boot args `nmxintel=1 nmxnofb=1 -v`. Pass: the log shows `NullMoth GPU: driving 8086:9a49` and
-   the desktop still works. Fail: capture the panic or hang, because the first failing function is the next work item.
-3. **Device nodes.** Build and load `NMDRM` (`NMX_MIN_OS=14.0`); `tools/drmlist` should list `8086:9a49` with a render node.
-4. **Vulkan.** Run `vkprobe` through ANV on the real render node: create a device, then compile a compute pipeline.
-5. **Accelerator.** Build `NMXAccel` (`build/nmxaccel_build.sh`) and see whether `system_profiler SPDisplaysDataType`
-   reports a Metal device. This is the stage most likely to need source changes on Sonoma: it subclasses Apple
-   IOAccelerator classes from reconstructed headers laid out for macOS 15 and 26.
-6. **Display.** Try without `nmxnofb`, and compare against `NMIntelFB`.
-
-Needed besides the kext: Intel firmware for Tiger Lake (`i915/tgl_dmc_*`, `tgl_guc_*`, `tgl_huc_*`, listed with
-checksums in `app/Resources/nullmoth-gpu-firmware.txt`), and for later stages the userland in `gpu-port/patches`.
-
-### What to report after a test
-
-The `NullMoth GPU:` and `NullMoth xkpi:` log lines:
-
-```bash
-log show --last boot --predicate 'eventMessage contains "NullMoth"'
-kmutil showloaded --list-only | grep -i nullmoth
-```
-
-plus the panic text if there was one, and which stage you reached.
-
-## Known limits (from the upstream port)
-
-- HDCP, writeback connectors and the panel-brightness quirk table are not offered (their DRM helpers are GPL).
-- dma-buf and sync_file file descriptors are not supported (a kext cannot create them); PRIME export reports `EOPNOTSUPP`.
-- Display: one mode (the largest output's), other outputs mirror the top-left; no mode switching yet.
-- DMI quirks see the Mac model the bootloader presents, not the PC's real board.
-- `package/install.sh` still installs from `/Library/NullMoth/kexts/15/`; the install path assumes macOS 15 and has
-  not been adapted for Sonoma.
+- Keep OpenCore on a USB stick with a known-good config, and know how to reset NVRAM.
+- `-nvoff` boots without the GPU driver. A boot that hangs during the driver's start is detected the next time
+  (NVRAM `nullmoth-gpu-attaching`) and the driver parks itself; clear it with `sudo nvram -d nullmoth-gpu-attaching`.
+- If acceleration froze the desktop, the helper does not arm on the next boot (`nvram nmx-autoarm-step`); clear with
+  `sudo nvram -d nmx-autoarm-step`.
+- Unsigned kexts need reduced SIP and Secure Boot off. Understand what that costs your machine's security.
 
 ## Repository map
 
 | Path | Contents |
 |---|---|
-| `gpu-port/xkpi/` | The AMD/Intel kernel port: build scripts, `bsdcompat/`, `override/`, `xnu/`, `kext/` |
-| `gpu-port/patches/` | Mesa (RADV/ANV) and libdrm patches for macOS |
-| `kexts/NMDRM`, `NMIntelFB`, `NVRM/accel` | DRM nodes, panel takeover, Metal accelerator |
-| `plugin/` | Metal driver plugin that selects the Vulkan back end |
-| `.github/workflows/nmxgpu-intel-build.yml` | The CI build |
-| `docs/INTEL-TIGERLAKE-SONOMA.md` | Detailed Tiger Lake / Sonoma bring-up notes |
-| `docs/README-NVIDIA.md` | Original NVIDIA driver README |
-| `nvk/`, `translator/`, `kexts/NVRM*`, `app/` | The NVIDIA side of the project; not used for Intel |
-| `gpu-port/kext-npu/`, `gpu-port/npu-user/` | NPU driver (GPL-2.0); not part of the Iris Xe build |
+| `gpu-port/xkpi/` | Kernel port: build scripts, `bsdcompat/`, `override/` (incl. the display bridge `nmx_fb_bridge.c`), `xnu/` (NMXGPU, NMXGPUFB) |
+| `gpu-port/patches/` | Mesa (ANV) and libdrm patches for macOS |
+| `kexts/NVRM/accel`, `kexts/NMDRM` | Accelerator, DRM nodes |
+| `plugin/` | Metal driver (NVMTLDriver.bundle) |
+| `translator/` | AIR -> SPIR-V shader translator |
+| `tools/macos-helpers/` | Install, update and diagnostic scripts |
+| `.github/workflows/` | `nmxgpu-intel-build.yml`, `mesa-anv-build.yml` |
+| `DESIGN.md` | Engineering log: every build (b1xx), what was tried, what was found |
+| `docs/` | Upstream NVIDIA documents and the original Sonoma bring-up notes |
 
 ## License
 

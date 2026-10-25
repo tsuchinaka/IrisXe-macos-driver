@@ -1,3 +1,5 @@
+/* IOSurface-writing command buffers committed in this process and not yet finished (10-18, Brave zero-copy) */
+static volatile long nvmtl_surf_writers;
 /*
  * NullMoth NVIDIA driver for macOS
  * Copyright (c) 2026 NullMoth Systems.
@@ -51,7 +53,19 @@ static BOOL nvmtl_pumping;
 static void nvmtl_pump_buffers(void);
 static BOOL nvmtl_async_commit_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_ASYNC_COMMIT"); on = !(e && e[0] == '0');
+    if (on < 0) { const char *e = getenv("NVMTL_ASYNC_COMMIT");
+        /* b73: Chromium-family GPU helpers ("Brave Browser Helper", "Google Chrome Helper", ...) flicker and draw
+           black boxes under the async execution worker (backdrop-blur cards on the new-tab page); synchronous
+           commit fixes it. Default those processes to synchronous; NVMTL_ASYNC_COMMIT=1 turns async back on. */
+        const char *me = getprogname();
+        const int chromium = me && strstr(me, " Helper") != NULL;
+        /* b147: /Library/GPUBundles/nvmtl-synccommit makes every process synchronous (WindowServer cannot be given an
+           environment variable). 10-23: typed characters on blurred backgrounds (Safari toolbar, lock screen password
+           field) stay invisible until the next key, only on the accelerated path - the same backdrop-blur family as b73. */
+        const int syncfile = access("/Library/GPUBundles/nvmtl-synccommit", F_OK) == 0;
+        if (!e && syncfile) nvlog("commit: nvmtl-synccommit file - synchronous commit in %s", me ? me : "?");
+        on = e ? !(e[0] == '0') : (!chromium && !syncfile);
+        if (!e && chromium) nvlog("commit: %s is a Chromium-family helper - synchronous commit by default (b73 flicker fix)", me);
         nvlog("commit: %s (NVMTL_ASYNC_COMMIT=%s)", on ? "ASYNC (default) - execution worker, submit ahead, queue capacity enforced" : "synchronous (NVMTL_ASYNC_COMMIT=0)", e ? e : "unset"); }
     return on;
 }
@@ -188,6 +202,8 @@ static int nvmtl_skip_empty_on(void) {
     _legacyKernelEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
     _cbError = error; _cbstatus = error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     _executionDone = YES;
+    if (_surfCounted) { _surfCounted = NO; __atomic_sub_fetch(&nvmtl_surf_writers, 1, __ATOMIC_SEQ_CST); }
+    [_completionCondition broadcast];   /* waitUntilScheduled waits on this for IOSurface writers */
     [_completionCondition unlock];
     [_parts removeAllObjects];
     // Applications may retain completed command buffers. Pending overwrite
@@ -359,6 +375,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         BOOL published = result == 0;
         if (published) {
             for (NVMTLTexture *texture in part->surfaces) if (![texture nvmtlSurfaceOut]) published = NO;
+            if (published) for (NVMTLTexture *texture in part->surfaces) { NVMTLTexture *st = texture->_parent ? texture->_parent : texture; nvmtl_dump_surface(st->_surf); }
             for (id resource in part->resources)
                 if ([resource isKindOfClass:[NVMTLBuffer class]]) nvmtl_buffer_sync_out(resource);
         }
@@ -394,6 +411,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (_committed) return;
         [self nvmtlReserveQueue];
         _committed = YES;
+        if (_wroteSurface && !_surfCounted) { _surfCounted = YES; __atomic_add_fetch(&nvmtl_surf_writers, 1, __ATOMIC_SEQ_CST); }
         if (!__atomic_load_n(&_rep, __ATOMIC_ACQUIRE)) __atomic_store_n(&_rep, nvmtl_ep_enter(), __ATOMIC_RELEASE);
         [_completionCondition lock]; _cbstatus = MTLCommandBufferStatusCommitted; [_completionCondition unlock];
         [self nvmtlSealPartWithSignal:nil value:0 restart:NO];

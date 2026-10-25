@@ -31,6 +31,7 @@ for f in xnu/*.cpp; do
     b=$(basename "$f" .cpp)
     [ "$b" = nmx_npu_kext ] && continue   # NMXNPU's own entry point: kext-npu/build.sh compiles it; here it duplicates kmod_info
     n=$((n + 1))
-    ./ccxx.sh "$f" > "xlog_$b.txt" 2>&1 || { echo "XNU FAIL $b"; fail=$((fail + 1)); }
+    # b80: fatal - a missing IOKit-side object still linked (kexts allow undefined symbols) and only kmutil refused it
+    ./ccxx.sh "$f" > "xlog_$b.txt" 2>&1 || { echo "XNU FAIL $b"; grep -B2 -A4 "error:" "xlog_$b.txt" | head -40; exit 1; }
 done
 echo "runtime sources: $n  failed: $fail"

@@ -29,6 +29,16 @@
       <key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
       <key>IOProbeScore</key><integer>60000</integer>
     </dict>
+    <key>NMXFBHoldIntel</key><dict>
+      <key>CFBundleIdentifier</key><string>com.nullmoth.NMXGPU</string>
+      <key>IOClass</key><string>NMXFBHold</string>
+      <key>IOProviderClass</key><string>IOPCIDevice</string>
+      <!-- takes the framebuffer slot only when nmxintel=1 (probe declines otherwise); above NMIntelFB (60000) and IONDRV -->
+      <key>IOPCIPrimaryMatch</key><string>0x00008086&amp;0x0000ffff</string>
+      <key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+      <key>IOMatchCategory</key><string>IOFramebuffer</string>
+      <key>IOProbeScore</key><integer>65000</integer>
+    </dict>
   </dict>
   <key>OSBundleLibraries</key><dict>
     <key>com.apple.kpi.bsd</key><string>8.0</string>

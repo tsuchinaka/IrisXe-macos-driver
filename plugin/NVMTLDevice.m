@@ -89,6 +89,17 @@ const char *nvmtl_log_path(void) {
     static char path[1024]; static int decided;
     if (!decided) {
         decided = 1;
+        /* b83: WindowServer logs to its own cache folder, which survives the restart a frozen desktop needs (/tmp does
+           not), every line synced to disk: sudo find /var/folders -name nvmtl-ws.log */
+        const char *me = getprogname();
+        if (me && !strcmp(me, "WindowServer")) {
+            char cd[900]; size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, cd, sizeof cd);
+            if (n > 0 && n <= sizeof cd) {
+                snprintf(path, sizeof path, "%snvmtl-ws.log", cd);
+                FILE *w = fopen(path, "a");
+                if (w) { fclose(w); return path; }
+            }
+        }
         FILE *f = fopen("/tmp/nvmtl.log", "a");
         if (f) { fclose(f); snprintf(path, sizeof path, "/tmp/nvmtl.log"); }
         else { const char *t = getenv("TMPDIR"); snprintf(path, sizeof path, "%s/nvmtl.log", (t && *t) ? t : "/private/tmp"); }
@@ -105,7 +116,15 @@ void nvlog(const char *fmt, ...) {
     if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
-    FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
+    FILE *f = fopen(nvmtl_log_path(), "a");
+    if (f) {
+        fprintf(f, "pid %d NVMTL: %s\n", getpid(), t);
+        // NVMTL_LOG_SYNC=1: each line reaches the disk before the plugin goes on, so a hard freeze (10-17: mtlwindow
+        // froze the whole machine and the last 25 s of every log were lost) still leaves the last step behind
+        static int sync_on = -1; if (sync_on < 0) sync_on = getenv("NVMTL_LOG_SYNC") != NULL || (getprogname() && !strcmp(getprogname(), "WindowServer"));
+        if (sync_on) { fflush(f); fsync(fileno(f)); }
+        fclose(f);
+    }
 #endif
 }
 
@@ -301,11 +320,15 @@ static bool nvmtl_process_is_allowed(void)
     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
     // WindowServer before its "!WindowServer" line is reached.
     { int hv = 0; size_t hn = sizeof hv;
-      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
+      /* b75: an AMD/Intel GPU that NMXGPU drives owns the display. With NMXAccel's nmxws=1 and the arm
+         (debug.nvaccelfb=1), WindowServer composites on it: it is not headless then. */
+      const int nmxws = nvmtl_vk_vendor() != 0x10de && nvmtl_accel_armed();
+      if (!strcmp(me, "WindowServer") && nmxws) nvlog("  WindowServer on the AMD/Intel GPU: NMXAccel is armed (nmxws=1, debug.nvaccelfb=1)");
+      if (!strcmp(me, "WindowServer") && !nmxws && (nvmtl_vk_vendor() != 0x10de ||
                                           (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
           nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
     if (getenv("NVMTL_ENABLE")) return true;
-    if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
+    if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender") || !strcmp(me, "mtldraw") || !strcmp(me, "mtlwindow")) return true;
     FILE *f = fopen("/Library/GPUBundles/nvmtl-allow.txt", "r");
     if (!f) f = fopen("/Library/Extensions/nvmtl-allow.txt", "r");
     if (!f) { nvlog("  no allow-list readable from this process: no device for %s (cannot read nvmtl-allow.txt)", me); return false; }
@@ -673,7 +696,22 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
 
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
 #define NVMTL_VRAM_MAGIC 0x564d5634u
-static unsigned long long g_surf_vram, g_surf_private, g_surfin_skip, g_surfin_copy;
+static unsigned long long g_surf_vram, g_surf_private, g_surfin_skip, g_surfin_copy, g_surf_host;
+static int nvmtl_surface_host_on(void)
+{
+    static int on = -1;
+    /* 10-18: OFF by default again - with it on, Brave's GPU process kept losing its context ("GPU event segment
+       submission failed": submissions that use the imported pages fail at random) until that is fixed.
+       NVMTL_SURFACE_HOST=1 turns it on for testing. */
+    /* 10-18 (build 70): ON again - the kernel userptr fix (build 68) ended the lost contexts. NVMTL_SURFACE_HOST=0: copies */
+    /* b144: also off with the file /Library/GPUBundles/nvmtl-nosurfhost (WindowServer cannot be given an environment
+       variable) - test for the invisible typed characters: they happen only on the accelerated path, one update behind,
+       as if the GPU sampled an app's IOSurface before (or without seeing) its latest CPU-drawn glyph. */
+    if (on < 0) { const char *e = getenv("NVMTL_SURFACE_HOST");
+                  on = !(e && e[0] == '0') && access("/Library/GPUBundles/nvmtl-nosurfhost", F_OK) != 0;
+        nvlog("zero-copy IOSurface textures: %s (NVMTL_SURFACE_HOST=%s)", on ? "ON (host-pointer import)" : "off (copies)", e ? e : "unset"); }
+    return on;
+}
 static CFStringRef nvmtl_vram_tag_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane); }
 static int nvmtl_vram_tag_current(IOSurfaceRef surf, NSUInteger plane, uint32_t seed)
 {
@@ -730,12 +768,41 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             }
         }
     }
+    /* 10-18 zero-copy (Brave: each tile copy cost 0.6-8 ms). The IOSurface's pages are ordinary memory the Iris Xe can
+       reach (VK_EXT_external_memory_host, pinned by the kernel's userptr path): import them and build a linear image
+       over them at the surface's own row pitch, so the GPU draws into and reads from the surface directly - no
+       surface-in upload, no surface-out readback. Any refusal falls back to the private image + copies below.
+       NVMTL_NO_SURFACE_HOST=1 turns it off. */
+    if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_surface_host_on()) {
+        size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf), alloc = IOSurfaceGetAllocSize(surf);
+        alloc = (alloc + 4095) & ~(size_t)4095;   /* the surface's mapping is whole pages even when its size is not */
+        void *base = IOSurfaceGetBaseAddress(surf);
+        if (base && (size_t)w * (bpp ? bpp : 4) <= row && h <= sh && alloc >= row * h) {
+            nvk_buffer hb;
+            if (!nvmtl_vk_buffer_import_host(base, alloc, &hb)) {
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &hb, 0, row, &t->_i)) {
+                    t->_hostBuf = hb; t->_hostOn = YES; g_surf_host++;
+                    t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+                    static unsigned n; if (n++ < 8 || n % 2000 == 0)
+                        nvlog("zero-copy: surface %u %ux%u pitch %zu imported (%llu zero-copy, %llu copied)", (unsigned)IOSurfaceGetID(surf),
+                              w, h, row, g_surf_host, g_surf_private);
+                    return 0;
+                }
+                nvmtl_vk_buffer_destroy(&hb);
+            }
+            static unsigned nf; if (nf++ < 8) nvlog("zero-copy: surface %u %ux%u pitch %zu alloc %zu at %p NOT imported - copied instead",
+                                                    (unsigned)IOSurfaceGetID(surf), w, h, row, alloc, base);
+        }
+    }
     g_surf_private++;
     return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
 }
 
+static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     if (nvmtl_vk_init()) return nil;
+    nvtrace("NEWSURFTEX surf %u %lux%lu fmt %lu plane %lu seed %u", surf ? (unsigned)IOSurfaceGetID(surf) : 0u, (unsigned long)d.width, (unsigned long)d.height,
+            (unsigned long)d.pixelFormat, (unsigned long)plane, surf ? (unsigned)IOSurfaceGetSeed(surf) : 0u);
     size_t w = d.width, h = d.height;
     if (!w || !h || w > UINT32_MAX || h > UINT32_MAX) return nil;
     if (surf && plane >= MAX((size_t)1, IOSurfaceGetPlaneCount(surf))) return nil;
@@ -746,14 +813,33 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
+    /* b163: Photo Booth stayed black (10-24). CoreImage renders the camera picture into the layer's drawable with
+       CIRenderDestination, which refuses a texture whose -usage lacks ShaderWrite ("texture usage must include
+       MTLTextureUsageShaderWrite. The destination is nil." 59 times). A drawable of a layer with framebufferOnly = NO is
+       shader-writable on Apple's drivers. So: an IOSurface colour texture that is not framebuffer-only and is a render
+       target (or asks Unknown usage) is made a storage image too, and reports ShaderWrite only when that worked.
+       Not WindowServer (its surfaces stay exactly as before). NVMTL_NO_SURFACE_SW=1 turns it off. */
+    MTLTextureUsage repUsage = d.usage;
+    static int noSW = -1; if (noSW < 0) noSW = getenv("NVMTL_NO_SURFACE_SW") != NULL;
+    const BOOL ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+    const BOOL addSW = !noSW && !ws && !t->_fbo && !wantStex && bpp == 4 && !a8 &&
+                       (d.usage == MTLTextureUsageUnknown || (d.usage & MTLTextureUsageRenderTarget));
+    int rc = nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex || addSW);
+    if (rc && addSW) { memset(&t->_i, 0, sizeof t->_i); t->_hostOn = NO; t->_vramOn = NO;
+                       rc = nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex); }
+    if (rc) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
+    if (addSW && t->_i.storage)
+        repUsage = (d.usage == MTLTextureUsageUnknown ? (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget) : d.usage) | MTLTextureUsageShaderWrite;
+    { static unsigned nu; if (nu++ < 12)
+        nvlog("b163 surface texture usage: asked 0x%lx fbo %d -> reports 0x%lx (storage %d%s)", (unsigned long)d.usage, (int)t->_fbo,
+              (unsigned long)repUsage, (int)(t->_i.storage != 0), addSW ? (t->_i.storage ? ", ShaderWrite added" : ", ShaderWrite NOT possible") : ""); }
     t->_q = nvmtl_device_queue();
     t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; }
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage != 0;
-    t->_usage = d.usage;
+    t->_usage = repUsage;
     nvmtl_texture_desc_swizzle(t, d);
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);

@@ -1,0 +1,14 @@
+How to install a new Metal plugin (NVMTLDriver.bundle) from the nmxgpu-intel-build workflow
+=========================================================================================
+Do NOT replace the whole /Library/GPUBundles/NVMTLDriver.bundle. The kext build makes only the plugin binary; the
+shader reader (Contents/MacOS/air-runtime/libLLVM.dylib) comes only from the "Mesa ANV + Metal plugin" workflow.
+Replacing the whole bundle deletes it, and then every shader that is not already cached fails (missing lock-screen
+password dots, Sequoia/Macintosh wallpapers falling back, slow menu bar after unlock - 10-21).
+
+  sudo ./tools/macos-helpers/nmx-plugin-update.sh ~/Downloads/<build folder>/out/NVMTLDriver.bundle
+  sudo reboot
+
+It replaces only Contents/MacOS/NVMTLDriver (the previous one is kept as /Library/GPUBundles/NVMTLDriver.previous)
+and prints "OK: shader reader present". If it prints a WARNING instead, restore air-runtime from a full bundle:
+
+  sudo ./tools/macos-helpers/nmx-plugin-update.sh <new bundle> <full bundle with air-runtime>

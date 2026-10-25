@@ -11,12 +11,15 @@
 #endif
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <string.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <pexpert/pexpert.h>
 #include <libkern/OSKextLib.h>
 #include <mach/kmod.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IORangeAllocator.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
+#include <kern/thread_call.h>
 #include "IOAccelerator.h"
 #include "IOGraphicsAccelerator2.h"
 #include "IOAccelEventMachineFast2.h"
@@ -32,6 +35,18 @@ static bool               nvAccelFlipTo(IOAccelResource2 *res);
 static bool               nvAccelCopyToScanout(IOAccelResource2 *res);
 void                      nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2);
 bool                      nvAccelResHasContent(IOAccelResource2 *res);
+#ifdef NMX_ACCEL
+bool                      nmxSwapPresent(IOAccelResource2 *a1, IOAccelResource2 *a2);
+void                      nmxShadowForget(void *kva);
+void                      nmxSwapStat(unsigned long long t0, unsigned long long t1, bool copied);
+void                      nmxNoteFront(IOAccelResource2 *res);
+void                      nmxSwapKeepFront(IOAccelResource2 *a1, IOAccelResource2 *shown);
+bool                      nmxSwapIsStale(IOAccelResource2 *a2);
+void                      nmxSwapNoteA1(IOAccelResource2 *a1);
+IOReturn                  nmxCopyForward(unsigned int mode, IOAccelResource2 *a, IOAccelResource2 *b, const void *bounds, unsigned int n);
+int                       nmxSwapSync(IOAccelResource2 *a1, IOAccelResource2 *a2);
+void                      nmxSyncForget(void *kva);
+#endif
 static void               nvAccelWriteStamp(int index, unsigned int value);
 #ifdef NMX_ACCEL
 #define NV_LOG_TAG "NMXAccel: "
@@ -43,6 +58,8 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
 #include "nvrm_vram_abi.h"
 #include <IOKit/IODeviceMemory.h>
 #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
+#include <libkern/OSAtomic.h>
+extern "C" uint64_t mach_absolute_time(void);
 #include "nvaccel_stubs.h"
 #include "nvkms-kapi.h"
 #include <sys/sysctl.h>
@@ -56,6 +73,12 @@ static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeall
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
 static void nvaccelInstallSysctl(void);
 static int gNvAccelArmed = 0;
+#ifdef NMX_ACCEL
+// b75: boot-arg nmxws=1 lets WindowServer composite on this accelerator (NMXGPUFB becomes head 0 of its display
+// machine). Nothing changes until `sysctl debug.nvaccelfb=1` + `debug.nvaccel_iop=1` and a WindowServer restart; a
+// reboot undoes the arm.
+static int gNmxWs = 0;
+#endif
 // 1 once the headless check restored the plugin name without arming (no NVIDIA display head). The Metal plugin reads it:
 // a headless GPU hands frames to another GPU's WindowServer through system memory, so IOSurfaces must be copied out.
 static int gNvHeadless = 0;
@@ -104,6 +127,12 @@ public:
 };
 OSDefineMetaClassAndStructors(NVEventMachine, IOAccelEventMachineFast2)
 static void (*gEnableAccel)(const char *why) = nullptr;
+/* b132: 1 = after a system wake, finish a display-mode change the sleep left open (see NVAccel::wakeFire) */
+static int gNmxWakeFix = 1;
+/* b146: raise the transaction interrupt after each display-pipe transaction (see NMXDisplayPipeM::performTransaction) */
+static int gIopTxSig = 1;
+static SInt64 gCntIopTxSig;
+static SInt64 gCntNmxWakeFixes;
 static int gNvScanout = 0;
 static int gNvAperture = 0;
 class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
@@ -118,6 +147,32 @@ public:
     }
 };
 OSDefineMetaClassAndStructors(NVDisplayMachine, IOAccelLegacyDisplayMachine)
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+/* b116: modern display machine (Apple Intel: IGAccelDisplayMachine : IOAccelDisplayMachine), picked by nmxmodern=1 */
+class NMXDisplayMachineM : public IOAccelDisplayMachine {
+    OSDeclareDefaultStructors(NMXDisplayMachineM)
+public:
+    bool displayModeWillChange() APPLE_KEXT_OVERRIDE { ALOG("DM(modern) displayModeWillChange"); return true; }
+    bool displayModeDidChange() APPLE_KEXT_OVERRIDE {
+        ALOG("DM(modern) displayModeDidChange -> true");
+        if (gEnableAccel) gEnableAccel("displayModeDidChange");
+        return true;
+    }
+};
+OSDefineMetaClassAndStructors(NMXDisplayMachineM, IOAccelDisplayMachine)
+#endif
+static int nmxModern()
+{
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+    static int on = -1;
+    if (on < 0) { int v = 0; on = (PE_parse_boot_argn("nmxmodern", &v, sizeof v) && v) ? 1 : 0;
+                  IOLog("NMXAccel: display classes %s\n", on ? "MODERN (nmxmodern=1, b116: IOAccelSurface / IOAccelDisplayPipe / IOAccelDisplayMachine, as Apple's Intel driver)"
+                                                          : "legacy (default; nmxmodern=1 = the modern ones)"); }
+    return on;
+#else
+    return 0;
+#endif
+}
 #define NV_PRIVATE_VA_BASE  0x800000000000ull
 #define NV_PRIVATE_VA_SIZE  0x000010000000ull
 class NVTask : public IOAccelTask {
@@ -130,7 +185,7 @@ public:
         const unsigned long long len = map ? ((IOAccelMemoryMap *)map)->getLength() : 0;
         const unsigned long long align = map ? *(const volatile unsigned long long *)((const unsigned char *)map + 0x80) : 0;
         unsigned long long got = nvAccelGpuVaAlloc((IOAccelMemoryMap *)map, len, align);
-        if (!got && fAllocLogged < 12)
+        if (!got && fAllocLogged < 12 && ++fAllocLogged)
             ALOG("NVTask::allocate: RM refused %llu bytes (align %llu) -- no GPU address", len, align);
         return got;
     }
@@ -150,6 +205,7 @@ public:
     unsigned long long fGpuVa     = 0;
     unsigned long long fVaLen     = 0;
     bool               fMapped    = false;
+    bool               fNmxPrivate = false;   // NMXAccel: a bookkeeping-only GPU VA (no NVIDIA RM behind it)
     unsigned int fCommits = 0;
     bool init(IOGraphicsAccelerator2 *a, IOAccelTask *t, IOAccelMemory *m,
               unsigned int o) APPLE_KEXT_OVERRIDE {
@@ -228,15 +284,26 @@ public:
     void      teardownDevice(IOPCIDevice *pci) APPLE_KEXT_OVERRIDE { ALOG("teardownDevice(%p)", pci); }
     OSObject *createKernelGPUTask() APPLE_KEXT_OVERRIDE { return newGPUTask("createKernelGPUTask"); }
     OSObject *newDisplayPipe() APPLE_KEXT_OVERRIDE {
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+        if (nmxModern()) { NMXDisplayPipeM *mp = OSTypeAlloc(NMXDisplayPipeM); ALOG("newDisplayPipe -> %p (modern, b116)", mp); return mp; }
+#endif
         NVDisplayPipe *p = OSTypeAlloc(NVDisplayPipe);
         if (!p) { ALOG("newDisplayPipe: OSTypeAlloc FAILED - the family will store this NULL unchecked"); return NULL; }
         ALOG("newDisplayPipe -> %p", p); return p; }
-    OSObject *newDisplayMachine() APPLE_KEXT_OVERRIDE { NVDisplayMachine *d = OSTypeAlloc(NVDisplayMachine);
+    OSObject *newDisplayMachine() APPLE_KEXT_OVERRIDE {
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+        if (nmxModern()) { NMXDisplayMachineM *md = OSTypeAlloc(NMXDisplayMachineM); fDM = md; ALOG("newDisplayMachine -> %p (modern, b116)", md); return md; }
+#endif
+        NVDisplayMachine *d = OSTypeAlloc(NVDisplayMachine);
         fDM = d;
         ALOG("newDisplayMachine -> %p", d); return d; }
     OSObject *newGLContext() APPLE_KEXT_OVERRIDE { NVGLContext *c = OSTypeAlloc(NVGLContext); ALOG("newGLContext -> %p", c); return c; }
     OSObject *newCLContext() APPLE_KEXT_OVERRIDE { NVCLContext *c = OSTypeAlloc(NVCLContext); ALOG("newCLContext -> %p", c); return c; }
-    OSObject *newSurface() APPLE_KEXT_OVERRIDE { NVSurface *o = OSTypeAlloc(NVSurface); ALOG("newSurface -> %p", o); return o; }
+    OSObject *newSurface() APPLE_KEXT_OVERRIDE {
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+        if (nmxModern()) { NMXSurfaceM *m = OSTypeAlloc(NMXSurfaceM); static SInt32 n; if (OSIncrementAtomic(&n) < 8) ALOG("newSurface -> %p (modern, b116)", m); return m; }
+#endif
+        NVSurface *o = OSTypeAlloc(NVSurface); ALOG("newSurface -> %p", o); return o; }
     OSObject *new2DContext() APPLE_KEXT_OVERRIDE { NV2DContext *c = OSTypeAlloc(NV2DContext); ALOG("new2DContext -> %p", c); return c; }
     OSObject *newVideoContext() APPLE_KEXT_OVERRIDE { NVVideoContext *c = OSTypeAlloc(NVVideoContext); ALOG("newVideoContext -> %p", c); return c; }
     OSObject *newSysMemory() APPLE_KEXT_OVERRIDE { NVSysMemory *m = OSTypeAlloc(NVSysMemory); ALOG("newSysMemory -> %p", m); return m; }
@@ -244,9 +311,50 @@ public:
     OSObject *newResource() APPLE_KEXT_OVERRIDE { NVResource *r = OSTypeAlloc(NVResource); OSAddAtomic64(1, &gCntResNew); ALOG("newResource -> %p", r); return r; }
     OSObject *newMemoryMap() APPLE_KEXT_OVERRIDE { NVMemoryMap *m = OSTypeAlloc(NVMemoryMap); ALOG("newMemoryMap -> %p", m); return m; }
 
-    NVDisplayMachine *fDM = nullptr;
+    IOAccelDisplayMachine *fDM = nullptr;   /* b116: legacy NMXDisplayMachine or modern NMXDisplayMachineM */
     IOPCIDevice *fPCI = nullptr;
     IONotifier *fFBNote = nullptr;
+    /* b132 (wake): 10-22 the first real sleep (b131, nmx-fbpm=1) woke to a black desktop with only the cursor. At sleep the
+       display machine got displayModeWillChange and after the wake never displayModeDidChange; WindowServer then logged
+       "Fallback GPU Display Pipe transaction submission failed" and not one transaction reached performTransaction. Here
+       the wake is watched and, 1.5 s later, a mode change still open (nest at display machine +0x10c) is finished. */
+    IONotifier *fPmNote = nullptr;
+    thread_call_t fWakeCall = nullptr;
+    int fWakeTries = 0;
+    static IOReturn pmMessage(void *target, void *, UInt32 type, IOService *, void *arg, vm_size_t) {
+        NVAccel *me = (NVAccel *)target;
+        if (type == kIOMessageCanSystemSleep || type == kIOMessageSystemWillSleep) {
+            if (arg) ((IOPowerStateChangeNotification *)arg)->returnValue = 0;      /* acknowledged at once */
+            if (type == kIOMessageSystemWillSleep && me && me->fDM)
+                ALOG("pm: system will sleep (mode-change nest %u)", *(const volatile uint32_t *)((uint8_t *)me->fDM + 0x10c));
+        } else if (type == kIOMessageSystemHasPoweredOn && me && me->fWakeCall) {
+            me->fWakeTries = 3;
+            uint64_t dl; clock_interval_to_deadline(1500, kMillisecondScale, &dl);
+            thread_call_enter_delayed(me->fWakeCall, dl);
+        }
+        return kIOReturnSuccess;
+    }
+    static void wakeFire(thread_call_param_t p, thread_call_param_t) {
+        NVAccel *me = (NVAccel *)p;
+        if (!me || !me->fDM) return;
+        if (me->fRegLock) IOLockLock(me->fRegLock);
+        uint8_t *dm = (uint8_t *)me->fDM;
+        const uint32_t nest = *(const volatile uint32_t *)(dm + 0x10c);
+        ALOG("pm: woke - display mode-change nest %u, pipes %u%s", nest, *(const volatile uint32_t *)(dm + 0x108),
+             gNmxWakeFix ? "" : " (fix off: sysctl debug.nvaccel_wakefix=0)");
+        me->reportPipeGates("after wake");
+        if (gNmxWakeFix && nest > 0 && nest < 8) {
+            ALOG("pm: a display-mode change is still open after the wake - finishing it (display_mode_did_change)");
+            me->fDM->display_mode_did_change(0);
+            OSAddAtomic64(1, &gCntNmxWakeFixes);
+            me->reportPipeGates("after the wake fix");
+        }
+        if (me->fRegLock) IOLockUnlock(me->fRegLock);
+        if (--me->fWakeTries > 0) {
+            uint64_t dl; clock_interval_to_deadline(2000, kMillisecondScale, &dl);
+            thread_call_enter_delayed(me->fWakeCall, dl);
+        }
+    }
     IONotifier *fIntelNote = nullptr;
     static NVAccel *gAccel;
     IOService *fFB = nullptr;
@@ -445,8 +553,37 @@ public:
         unsigned after = fDM->getFramebufferCount();
         ALOG("  framebuffer count after = %u", after);
         if (after > before) { onCountGrewLocked(); return true; }
+#ifdef NMX_ACCEL
+        // b76: NMXGPUFB is on the same PCI device as this accelerator and published first, so the family's own sweep at
+        // start() already gave it a pipe (10-19 log: "count before = 1", IOAccelIndex 0 on NMXGPUFB). found_framebuffer
+        // then adds nothing. Adopt that pipe instead of reporting a failure.
+        if (gNmxWs && adoptExistingPipesLocked()) { onCountGrewLocked(); return true; }
+#endif
         return false;
     }
+#ifdef NMX_ACCEL
+    bool adoptExistingPipesLocked() {
+        if (!fDM) return false;
+        uint8_t *dm = (uint8_t *)fDM;
+        const uint32_t n = *(const volatile uint32_t *)(dm + 0x108);
+        if (n > 8) { ALOG("  adopt: implausible pipe count %u -- not walking it", n); return false; }
+        bool any = false;
+        for (uint32_t p = 0; p < n; p++) {
+            void *pipe = *(void *const volatile *)(dm + 0x88 + 8 * p);
+            if (!pipe) continue;
+            IOService *pfb = *(IOService *const volatile *)((const uint8_t *)pipe + 0x98);
+            for (unsigned i = 0; i < kNvMaxFB; i++) {
+                if (!fFBs[i] || fFBs[i] != pfb) continue;
+                fFBRegistered |= 1u << i; gNvHeadsRegistered = fFBRegistered;
+                gNvHeadsPiped |= 1u << i; any = true;
+                ALOG("  adopt: pipe %u (%p) already drives %s (index %u) -- the family's sweep made it; using it", p, pipe,
+                     pfb->getName(), i);
+            }
+        }
+        if (!any) ALOG("  adopt: none of the family's %u pipe(s) drives a framebuffer of ours", n);
+        return any;
+    }
+#endif
     const OSSymbol *fSymAlloc = nullptr, *fSymFree = nullptr;
     IOReturn askFramebufferForVram(struct NVRMVramRequest *r, bool alloc) {
         if (!fFB) return kIOReturnNotAttached;
@@ -482,12 +619,24 @@ public:
                      (handler && *handler) ? (*handler)->getMetaClass()->getClassName() : "(none)"); }
             return fr;
         }
+        IOUserClient *uc = nullptr;
 #ifdef NMX_ACCEL
-        // NVIDIA RM clients are NVK's; RADV and ANV talk to NMXGPU's DRM device nodes instead
-        ALOG("newUserClient(0x%x): an NVIDIA RM client type on an AMD/Intel accelerator -- refused", type);
-        return kIOReturnUnsupported;
-#endif
-
+        // b80: the DRM render node over IOKit, for processes whose sandbox refuses open("/dev/dri/...") (WindowServer,
+        // browser GPU processes). NMXGPU makes the client (nmx_drm_bridge.cpp); it is parked on a carrier as NVIDIA's are.
+        {
+            if (!fNVRM) {
+                OSDictionary *m = serviceMatching("NMXGPU");
+                if (m) fNVRM = waitForMatchingService(m, 100ULL * 1000 * 1000);
+            }
+            if (!fNVRM) { ALOG("newUserClient(0x%x): no NMXGPU service", type); return kIOReturnNotAttached; }
+            const OSSymbol *fnSym = OSSymbol::withCStringNoCopy("nmxNewDrmClient");
+            if (!fnSym) return kIOReturnNoMemory;
+            IOReturn r = fNVRM->callPlatformFunction(fnSym, false, (void *)owningTask,
+                                                     (void *)(uintptr_t)(type & 0xFFFFu), &uc, nullptr);
+            fnSym->release();
+            if (r != kIOReturnSuccess || !uc) { ALOG("newUserClient(0x%x): NMXGPU refused the DRM bridge (0x%x)", type, r); return r ? r : kIOReturnNoResources; }
+        }
+#else
         if (!fNVRM) {
             OSDictionary *m = serviceMatching("NVRM");
             if (m) fNVRM = waitForMatchingService(m, 100ULL * 1000 * 1000);
@@ -496,11 +645,11 @@ public:
 
         const OSSymbol *fnSym = OSSymbol::withCStringNoCopy("nvNewAccelClient");
         if (!fnSym) return kIOReturnNoMemory;
-        IOUserClient *uc = nullptr;
         IOReturn r = fNVRM->callPlatformFunction(fnSym, false, (void *)owningTask,
                                                  (void *)(uintptr_t)(type & 0xFFFFu), &uc, nullptr);
         fnSym->release();
         if (r != kIOReturnSuccess || !uc) { ALOG("newUserClient(0x%x): NVRM refused (0x%x)", type, r); return r ? r : kIOReturnNoResources; }
+#endif
 
         IOService *carrier = nullptr;
         for (unsigned i = 0; i < NV_CARRIERS && !carrier; i++)
@@ -519,6 +668,24 @@ public:
     }
     static void triggerFromSysctl(int how) {
         if (!gAccel) { ALOG("sysctl debug.nvaccelfb=%d but no NVAccel is running", how); return; }
+#ifdef NMX_ACCEL
+        /* b112: the Phase 3 boot freezes were this panic (Kernel-2026-10-20-132943, uptime 10.9 s, nmxautoarm=1):
+           nvaccelfb -> registerFramebufferLocked -> deliverModeChange -> IOAccelLegacyDisplayPipe::displayModeDidChange
+           -> IOFramebuffer::getAttributeExt, NULL + 0x120. An IOFramebuffer has no controller until WindowServer opens
+           it (nmx_fb.cpp), and the mode-change broadcast reads it. With debug=0x100 the Mac halts: black screen, no SSH.
+           NMXGPUFB (b103+) sets NMXFBOpened when WindowServer opens it: until then the arm is refused, not crashed. */
+        if (gNmxWs && how >= 1) {
+            IOService *fb = gAccel->fFB;
+            const bool nmxfb = fb && fb->metaCast("NMXGPUFB") != nullptr;
+            if (!fb || (nmxfb && fb->getProperty("NMXFBOpened") != kOSBooleanTrue)) {
+                ALOG("sysctl debug.nvaccelfb=%d REFUSED: the framebuffer %s - arming now would panic the Mac "
+                     "(IOFramebuffer::getAttributeExt on a framebuffer WindowServer has not opened). Try again once the "
+                     "login window is on screen. (Needs NMXGPU build 103 or newer for the NMXFBOpened signal.)",
+                     how, !fb ? "has not published yet" : "is not opened by WindowServer yet");
+                return;
+            }
+        }
+#endif
         if (how >= 4) gNvAperture = 1;
         if (how >= 3) {
             gNvScanout = 1;
@@ -567,6 +734,10 @@ public:
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
         { if (nvrm_driver_off()) return false; }
 #ifdef NMX_ACCEL
+        {   // boot-loop guard while the accelerator is new on Intel (as nvaccel=1 for NVIDIA): it starts only with nmxaccel=1
+            uint32_t on = 0;
+            if (!PE_parse_boot_argn("nmxaccel", &on, sizeof on) || !on) { ALOG("boot-arg nmxaccel=1 absent: NOT starting"); return false; }
+        }
         // NMXGPU decides which AMD/Intel GPUs are driven (nmxamd=1 / nmxintel=1 / nullmoth-gpu); this accelerator only
         // starts on a device it has claimed, so a GPU macOS drives itself never gets a second accelerator
         // No waiting here: NMXGPU attaches from a thread once the disks with its firmware are mounted, and mounting waits
@@ -615,6 +786,11 @@ public:
             fPCI = OSDynamicCast(IOPCIDevice, provider);
             ALOG("display machine framebuffer count after the family sweep = %u", fDM ? fDM->getFramebufferCount() : 0xFFFFFFFFu);
             fRegLock = IOLockAlloc();
+#ifdef NMX_ACCEL
+            fWakeCall = thread_call_allocate(&NVAccel::wakeFire, this);
+            fPmNote = fWakeCall ? registerSleepWakeInterest(&NVAccel::pmMessage, this, nullptr) : nullptr;
+            ALOG("pm: watching sleep/wake -> %p (b132 wake fix %s)", fPmNote, gNmxWakeFix ? "on" : "off");
+#endif
             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
                  fRegLock ? "" : " -- NULL: two sysctl writers could interleave a registration");
 #ifdef NMX_ACCEL
@@ -625,6 +801,14 @@ public:
             setProperty("NMXAccelHeadless", kOSBooleanTrue);
             ALOG("AMD/Intel accelerator up: Metal device for apps, frames copied to the framebuffer WindowServer draws");
             OSDictionary *fbm = nullptr;
+            { uint32_t ws = 0;
+              if (PE_parse_boot_argn("nmxws", &ws, sizeof ws) && ws) {
+                  gNmxWs = 1;
+                  nvaccelInstallSysctl();
+                  fbm = serviceMatching("NMXGPUFB");
+                  ALOG("nmxws=1: watching for NMXGPUFB (head 0) -- WindowServer acceleration arms with "
+                       "`sysctl -w debug.nvaccelfb=1 debug.nvaccel_iop=1` and a WindowServer restart");
+              } }
 #else
             OSDictionary *fbm = serviceMatching("NVRMNVDAFramebuffer");
 #endif
@@ -639,7 +823,11 @@ public:
                     ALOG("watching for an Intel built-in panel (NMIntelFB) -> notifier %p", fIntelNote);
                 }
                 nvaccelInstallSysctl();
+#ifdef NMX_ACCEL
+                if (false) {   // NMX: apps already use the Metal device; WindowServer is gated by the plugin's armed check
+#else
                 if (getProperty("MetalPluginName")) {
+#endif
                     OSObject *mp = getProperty("MetalPluginName"); if (mp) mp->retain();
                     fMetalPlugin = mp;
                     removeProperty("MetalPluginName");
@@ -657,7 +845,7 @@ public:
 OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
 NVAccel *NVAccel::gAccel = nullptr;
 
-IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
+template <class PipeT> static IOAccelMemory *nvpipe_initFramebufferResource(PipeT *self, unsigned int index, IOAccelResource2 *res)
 {
     if (!gNvScanout) {
         ALOG("NVDisplayPipe::initFramebufferResource(index %u): scanout gate CLOSED -- returning NULL, "
@@ -667,11 +855,11 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
     NVAccel *a = NVAccel::gAccel;
     if (!a || !res) { ALOG("NVDisplayPipe::initFramebufferResource: no accelerator or no resource"); return nullptr; }
     unsigned head = 0;
-    IOService *fb = a->pipeFramebuffer(this, &head);
+    IOService *fb = a->pipeFramebuffer(self, &head);
     if (!fb) {
         ALOG("NVDisplayPipe::initFramebufferResource(index %u): pipe %p drives framebuffer %p, which is none of ours -- "
-             "refusing (never head 0's pages: that IS the bug)", index, this,
-             *(void *const volatile *)((const uint8_t *)this + 0x98));
+             "refusing (never head 0's pages: that IS the bug)", index, self,
+             *(void *const volatile *)((const uint8_t *)self + 0x98));
         return nullptr;
     }
 
@@ -691,6 +879,22 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
         if (o) o->release();
         return nullptr;
     }
+#ifdef NMX_ACCEL
+    // b92 (10-19): on Intel the framebuffer resource is a SHADOW in ordinary RAM (allocPhysical gives it nvAllocVram
+    // memory), not the live scan-out. WindowServer reads it with the GPU (the login transition's CaptureSurfaceMetal made
+    // a 2560x1600 texture over it); the scan-out sits in the GPU aperture, which Mesa can only import as a user pointer
+    // of device memory, and EXECBUFFER2 failed with EFAULT -> VK_ERROR_DEVICE_LOST -> "Vulkan is not up" -> WindowServer
+    // abort at every login (10-19 20:40). Frames still reach the panel through the swap copy, which copies whichever
+    // swap argument holds the picture - self shadow too, when WindowServer draws into it directly.
+    {
+        static SInt32 gShadowLogs;
+        if (OSIncrementAtomic(&gShadowLogs) < 6)
+            ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u, res %p) -> vidmem %p, a SHADOW in system RAM "
+                 "(%llu bytes; the scan-out at phys 0x%llx is fed by the swap copy)", head, index, res, m,
+                 (unsigned long long)r.actualSize, (unsigned long long)r.phys);
+        return (IOAccelMemory *)m;
+    }
+#endif
     m->fScanout = true;
     m->fPhys    = r.phys;
     m->fBytes   = r.actualSize;
@@ -701,6 +905,10 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
          (unsigned long long)r.actualSize);
     return (IOAccelMemory *)m;
 }
+IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res) { return nvpipe_initFramebufferResource(this, index, res); }
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+IOAccelMemory *NMXDisplayPipeM::initFramebufferResource(unsigned int index, IOAccelResource2 *res) { return nvpipe_initFramebufferResource(this, index, res); }
+#endif
 
 static NVVidMemory *nvres_vidmem(IOAccelResource2 *r)
 {
@@ -735,6 +943,12 @@ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
         if (fApLogged < 8) { fApLogged++;
             ALOG("NVResource::getApertureMemoryDescriptor: no BAR1-backed vidmem at +0x88 (mem %p)", m); }
         return nullptr;
+    }
+    if (m->fMd) {   // b90: ordinary RAM from the framebuffer: hand out its own descriptor (cached, any number of segments)
+        m->fMd->retain(); fApDesc = m->fMd;
+        if (fApLogged < 8) { fApLogged++;
+            ALOG("NVResource::getApertureMemoryDescriptor -> %p, system memory (%llu bytes, first page 0x%llx)", fApDesc, m->fBytes, m->fPhys); }
+        return fApDesc;
     }
     IODeviceMemory *d = IODeviceMemory::withRange((IOPhysicalAddress)m->fPhys, (IOPhysicalLength)m->fBytes);
     if (!d) { ALOG("NVResource::getApertureMemoryDescriptor: IODeviceMemory::withRange(0x%llx, %llu) FAILED",
@@ -783,6 +997,7 @@ bool NVVidMemory::allocPhysical()
         return false;
     }
     fRmHandle = r.handle; fKva = r.kva; fPhys = r.phys; fBytes = r.actualSize; fAllocationCookie = r.allocationCookie;
+    fMd = (r.flags & NVRM_VRAM_FLAG_MD) ? (IOMemoryDescriptor *)r.handle : nullptr;
     OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)fBytes, &gCntVmAllocBytes);
     *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
     ALOG("NVVidMemory::allocPhysical(%p): %llu bytes of REAL VRAM -- phys 0x%llx kva %p [BAR1 %llu]",
@@ -799,13 +1014,17 @@ void NVVidMemory::deallocPhysical()
         return;
     }
     if (!fRmHandle) return;
+#ifdef NMX_ACCEL
+    nmxShadowForget(fKva);
+    nmxSyncForget(fKva);
+#endif
     OSAddAtomic64(1, &gCntVmDealloc); OSAddAtomic64((SInt64)fBytes, &gCntVmDeallocBytes);
     struct NVRMVramRequest r;
     for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
     r.version = NVRM_VRAM_ABI_VERSION;
     r.handle = fRmHandle; r.kva = fKva; r.actualSize = fBytes; r.allocationCookie = fAllocationCookie;
     if (NVAccel::gAccel) NVAccel::gAccel->askFramebufferForVram(&r, false);
-    fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
+    fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0; fMd = nullptr;
     *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
 }
 
@@ -826,16 +1045,42 @@ public:
 
 static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+static SInt64 gCntIopCopyNs, gCntIopCopyMaxNs, gCntIopCopies;    /* b118: time spent copying frames to the panel */
+static bool nvIopSlowCopy(void)
+{
+    static int v = -1;
+    if (v < 0) { uint32_t b = 0; v = (PE_parse_boot_argn("nmxslowcopy", &b, sizeof b) && b) ? 1 : 0; }
+    return v == 1;
+}
 static SInt64 gCntIopOkHead[kNvMaxFB];
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
 #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
 #define NVIOP_FAIL(rc, fmt, ...) do { OSAddAtomic64(1, &gCntIopFail); NVIOPLOG(fmt, ##__VA_ARGS__); return (rc); } while (0)
 
-void NVDisplayPipe::iopDropSources()
+/* b125: shared by the flip path below and the pipe teardown here */
+static IOLock *gIopCopyLock;
+static int gIopFlipDb = -1;
+static SInt64 gCntIopDbFlips, gCntIopDbFail, gCntIopDbNs;
+struct NmxFlipReq { uint32_t version, op; void *kva; uint32_t pitch, w, h; int32_t err; };
+static void nvIopFlipHome(IOService *fb)
 {
-    for (unsigned i = 0; i < kIopSrcSlots; i++) {
-        NVIopSrc *e = &fIopSrc[i];
+    static const OSSymbol *sym;
+    if (!sym) sym = OSSymbol::withCStringNoCopy("nmxFlip");
+    if (!fb || !sym || !fb->metaCast("NMXGPUFB")) return;
+    NmxFlipReq r; bzero(&r, sizeof r); r.version = 1; r.op = 2;
+    (void)fb->callPlatformFunction(sym, false, &r, nullptr, nullptr, nullptr);
+}
+template <class PipeT> static void nvpipe_iopDropSources(PipeT *self)
+{
+    if (gIopFlipDb == 1 && NVAccel::gAccel) {      /* b125: the pipe is going away - the panel goes back to buffer 0 */
+        unsigned head = 0; IOService *fb = NVAccel::gAccel->pipeFramebuffer(self, &head);
+        IOLock *L = gIopCopyLock; if (L) IOLockLock(L);
+        nvIopFlipHome(fb);
+        if (L) IOLockUnlock(L);
+    }
+    for (unsigned i = 0; i < PipeT::kIopSrcSlots; i++) {
+        typename PipeT::NVIopSrc *e = &self->fIopSrc[i];
         if (e->map) { e->map->release(); e->map = nullptr; }
         if (e->md)  { e->md->complete(); e->md->release(); e->md = nullptr; }
         e->id = 0;
@@ -844,17 +1089,24 @@ void NVDisplayPipe::iopDropSources()
 
 void NVDisplayPipe::free()
 {
-    iopDropSources();
+    nvpipe_iopDropSources(this);
     IOAccelLegacyDisplayPipe::free();
 }
-
-const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, unsigned long long need)
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+void NMXDisplayPipeM::free()
 {
-    for (unsigned i = 0; i < kIopSrcSlots; i++)
-        if (fIopSrc[i].md == md && fIopSrc[i].id == id && fIopSrc[i].map)
-            return (fIopSrc[i].map->getLength() >= need) ? (const void *)fIopSrc[i].map->getVirtualAddress() : nullptr;
+    nvpipe_iopDropSources(this);
+    IOAccelDisplayPipe::free();
+}
+#endif
+
+template <class PipeT> static const void *nvpipe_iopMapSurface(PipeT *self, unsigned id, IOMemoryDescriptor *md, unsigned long long need)
+{
+    for (unsigned i = 0; i < PipeT::kIopSrcSlots; i++)
+        if (self->fIopSrc[i].md == md && self->fIopSrc[i].id == id && self->fIopSrc[i].map)
+            return (self->fIopSrc[i].map->getLength() >= need) ? (const void *)self->fIopSrc[i].map->getVirtualAddress() : nullptr;
     if (md->getLength() < need) return nullptr;
-    NVIopSrc *e = &fIopSrc[fIopNext % kIopSrcSlots]; fIopNext++;
+    typename PipeT::NVIopSrc *e = &self->fIopSrc[self->fIopNext % PipeT::kIopSrcSlots]; self->fIopNext++;
     if (e->map) { e->map->release(); e->map = nullptr; }
     if (e->md)  { e->md->complete(); e->md->release(); e->md = nullptr; }
     e->id = 0;
@@ -862,7 +1114,7 @@ const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, un
     IOMemoryMap *m = md->map(kIOMapReadOnly);
     if (!m) { md->complete(); return nullptr; }
     md->retain(); e->md = md; e->map = m; e->id = id;
-    NVIOPLOG("mapped source surface 0x%x (%llu bytes) into slot %u", id, (unsigned long long)m->getLength(), (fIopNext - 1) % kIopSrcSlots);
+    NVIOPLOG("mapped source surface 0x%x (%llu bytes) into slot %u", id, (unsigned long long)m->getLength(), (self->fIopNext - 1) % PipeT::kIopSrcSlots);
     return (const void *)m->getVirtualAddress();
 }
 
@@ -870,24 +1122,171 @@ IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *)
 {
     return kIOReturnSuccess;
 }
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+IOReturn NMXDisplayPipeM::validateTransaction(IOAccelDisplayPipeTransaction2 *)
+{
+    return kIOReturnSuccess;
+}
+#endif
 
 static bool nvAccelIopAsyncBusy(const void *pipe);
 bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
     return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
 }
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+bool NMXDisplayPipeM::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
+{
+    return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
+}
+#endif
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static void nvAccelIopHome(IOService *fb, unsigned head);
-IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+/*
+ * b123: settle copy. Each transaction copies WindowServer's composited surface to the panel at once. When the last
+ * frame of a burst (a key press on the lock screen, the end of an animation) is copied before the GPU has finished
+ * writing it, the panel keeps showing the older picture until something else changes - the 10-21 lock screen showed 2
+ * or 3 password dots for 4 typed characters. After every frame the same surface is copied again 40 ms and 150 ms
+ * later, unless a newer frame came in meanwhile (generation check under one lock shared with the transaction copy).
+ * Costs ~1.3 ms per settle, only when the screen goes idle. Off: sysctl debug.nvaccel_iop_settle=0.
+ */
+static volatile UInt32 gIopGen;
+static struct thread_call *gIopSettleCall;
+static struct { IOSurface *s; IOService *fb; unsigned head, w, h, pitch; UInt32 gen; int pass; uint64_t sum; unsigned sumWords; } gIopSettle;   // under gIopCopyLock
+static int gIopSettleOn = 1;
+static SInt64 gCntIopSettle, gCntIopSettleSkip;
+/* b129: late-change detector. A checksum of the surface is taken when the frame is copied and again at every settle pass
+   (40, 190, 440, 1040 ms). A change means WindowServer's GPU wrote the frame AFTER performTransaction handed it to us -
+   10-22: typed characters stayed invisible until the next key (copy and flip alike). The later passes also show it. */
+static int gIopLateChk = 0;   /* b130: off by default (1.1 ms per frame); b129 showed no late changes */
+static SInt64 gCntIopLate[4], gCntIopLateMs;
+static uint64_t nvIopSum(const volatile unsigned int *src, unsigned spr, unsigned words, unsigned h)
+{
+    uint64_t a = 0, b = 0;
+    const unsigned q = words / 2;
+    for (unsigned y = 0; y < h; y++) {
+        const uint64_t *r = (const uint64_t *)(const void *)(src + (unsigned long)y * spr);
+        for (unsigned x = 0; x < q; x++) { const uint64_t v = r[x]; a += v; b ^= v + x + y; b = (b << 7) | (b >> 57); }
+    }
+    return a ^ (b * 0x9E3779B97F4A7C15ull);
+}
+static IOLock *nvIopCopyLock(void)
+{
+    if (!gIopCopyLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopCopyLock)) IOLockFree(l); }
+    return gIopCopyLock;
+}
+static bool nvIopSlowCopy(void);
+static void nvIopCopyRows(volatile unsigned int *d, unsigned dpr, const volatile unsigned int *src, unsigned spr, unsigned words,
+                          unsigned h, unsigned pitch)
+{
+    if (nvIopSlowCopy()) {
+        for (unsigned y = 0; y < h; y++) {
+            const volatile unsigned int *sp = src + (unsigned long)y * spr;
+            volatile unsigned int *dp = d + (unsigned long)y * dpr;
+            for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+        }
+    } else if (spr == dpr && words == spr) {
+        memcpy((void *)d, (const void *)src, (size_t)h * pitch);
+    } else {
+        for (unsigned y = 0; y < h; y++)
+            memcpy((void *)(d + (unsigned long)y * dpr), (const void *)(src + (unsigned long)y * spr), (size_t)words * 4);
+    }
+}
+static void nvIopSettleArm(uint32_t ms)
+{
+    if (!gIopSettleCall) return;
+    uint64_t when = 0;
+    clock_interval_to_deadline(ms, kMillisecondScale, &when);
+    thread_call_enter_delayed(gIopSettleCall, when);
+}
+/*
+ * b125 (R2): flip instead of copy-to-the-visible-buffer. With boot-arg nmxflip=1 (or sysctl debug.nvaccel_iop_flipdb=1)
+ * each frame is copied into the scan-out buffer that is NOT on the panel and NMXGPU flips the primary plane to it at the
+ * next vblank (atomic commit, blocking until it is on screen): no tearing, no half-copied frame, a frame cadence locked
+ * to the panel. Turning it off flips back to the IOFramebuffer's own buffer. Caller holds gIopCopyLock.
+ */
+static bool nvIopFlipDbOn(void)
+{
+    /* b143: ON by default (10-22/23: stable, no lag, fine across sleep/wake). Boot-arg nmxflip=0 turns it off. */
+    if (gIopFlipDb < 0) { uint32_t v = 1; PE_parse_boot_argn("nmxflip", &v, sizeof v); gIopFlipDb = v ? 1 : 0;
+                          ALOG("iop: b125 double-buffered flip %s (boot-arg nmxflip=1, sysctl debug.nvaccel_iop_flipdb)", gIopFlipDb ? "ON" : "off"); }
+    return gIopFlipDb == 1;
+}
+static bool nvIopPresentFlip(IOService *fb, const volatile unsigned int *src, unsigned w, unsigned h, unsigned pitch)
+{
+    static const OSSymbol *sym;
+    if (!sym) sym = OSSymbol::withCStringNoCopy("nmxFlip");
+    if (!fb || !sym || !fb->metaCast("NMXGPUFB")) return false;
+    NmxFlipReq r; bzero(&r, sizeof r); r.version = 1; r.op = 0;
+    if (fb->callPlatformFunction(sym, false, &r, nullptr, nullptr, nullptr) != kIOReturnSuccess || !r.kva || r.w != w || r.h != h || r.pitch < 4) {
+        if (OSAddAtomic64(1, &gCntIopDbFail) < 6) ALOG("iop: flip: no back buffer for %ux%u (err %d, back %ux%u) - copied as before", w, h, r.err, r.w, r.h);
+        return false;
+    }
+    const uint64_t t0 = mach_absolute_time();
+    const unsigned words = (((pitch < r.pitch) ? pitch : r.pitch) & ~3u) / 4;
+    nvIopCopyRows((volatile unsigned int *)r.kva, r.pitch / 4, src, pitch / 4, words, h, pitch);
+    r.op = 1;
+    const IOReturn cr = fb->callPlatformFunction(sym, false, &r, nullptr, nullptr, nullptr);
+    OSAddAtomic64((SInt64)(mach_absolute_time() - t0), &gCntIopDbNs);
+    if (cr != kIOReturnSuccess) { OSAddAtomic64(1, &gCntIopDbFail); return false; }
+    OSAddAtomic64(1, &gCntIopDbFlips);
+    return true;
+}
+static void nvIopSettleFire(void *, void *)
+{
+    IOLock *L = nvIopCopyLock();
+    if (!L) return;
+    /* b127: never block a thread-call thread. 10-21 panic: "thread_call group 'high' reached max thread cap (500):
+       blocked 499" - each settle waited here while a frame's flip held the lock; a busy lock now just retries later. */
+    if (!IOLockTryLock(L)) { OSAddAtomic64(1, &gCntIopSettleSkip); nvIopSettleArm(40); return; }
+    IOSurface *s = gIopSettle.s;
+    if (!gIopSettleOn || !s || gIopSettle.gen != gIopGen || !NVAccel::gAccel) { OSAddAtomic64(1, &gCntIopSettleSkip); IOLockUnlock(L); return; }
+    IOMemoryDescriptor *md = s->getMemoryDescriptor();
+    IOMemoryMap *m = md ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly) : nullptr;
+    struct NVRMVramRequest q;
+    for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
+    q.version = NVRM_VRAM_ABI_VERSION;
+    const IOReturn ret = m ? NVAccel::gAccel->askFramebufferForScanout(&q, gIopSettle.fb) : kIOReturnNoMemory;
+    const unsigned w = gIopSettle.w, h = gIopSettle.h, pitch = gIopSettle.pitch;
+    const int pass = gIopSettle.pass;
+    bool changed = true;
+    if (m && gIopLateChk && m->getLength() >= (IOByteCount)h * pitch) {
+        const uint64_t sum = nvIopSum((const volatile unsigned int *)m->getVirtualAddress(), pitch / 4, gIopSettle.sumWords, h);
+        changed = sum != gIopSettle.sum;
+        if (changed) {
+            OSAddAtomic64(1, &gCntIopLate[pass & 3]);
+            static SInt32 lateLogs;
+            if (OSIncrementAtomic(&lateLogs) < 12)
+                ALOG("iop: b129 the frame CHANGED after it was shown (settle pass %d) - the GPU finished it late; copied again", pass);
+        }
+        gIopSettle.sum = sum;
+    }
+    if (pass >= 2 && !changed) { if (m) m->release(); if (pass == 2) { gIopSettle.pass = 3; nvIopSettleArm(600); } IOLockUnlock(L); return; }
+    if (m && nvIopFlipDbOn() && m->getLength() >= (IOByteCount)h * pitch
+        && nvIopPresentFlip(gIopSettle.fb, (const volatile unsigned int *)m->getVirtualAddress(), w, h, pitch)) {
+        OSAddAtomic64(1, &gCntIopSettle);
+    } else if (ret == kIOReturnSuccess && q.kva && q.pitch >= 4 && w == q.width && h == q.height
+        && m->getLength() >= (IOByteCount)h * pitch) {
+        const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
+        nvIopCopyRows((volatile unsigned int *)q.kva, q.pitch / 4, (const volatile unsigned int *)m->getVirtualAddress(), pitch / 4, words, h, pitch);
+        OSAddAtomic64(1, &gCntIopSettle);
+    } else OSAddAtomic64(1, &gCntIopSettleSkip);
+    if (m) m->release();
+    if (gIopSettle.pass == 0)      { gIopSettle.pass = 1; nvIopSettleArm(150); }
+    else if (gIopSettle.pass == 1) { gIopSettle.pass = 2; nvIopSettleArm(250); }
+    else if (gIopSettle.pass == 2) { gIopSettle.pass = 3; nvIopSettleArm(600); }
+    IOLockUnlock(L);
+}
+template <class PipeT> static IOReturn nvpipe_performTransaction(PipeT *self, IOAccelDisplayPipeTransaction2 *txn)
 {
     if (!gNvIop) return (IOReturn)0xe00002c7;
     if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
     NVAccel *a = NVAccel::gAccel;
     unsigned head = 0;
-    IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
-    if (!fb) NVIOP_FAIL(kIOReturnNotAttached, "no accelerator, or pipe %p drives a framebuffer that is none of ours", this);
+    IOService *fb = a ? a->pipeFramebuffer(self, &head) : nullptr;
+    if (!fb) NVIOP_FAIL(kIOReturnNotAttached, "no accelerator, or pipe %p drives a framebuffer that is none of ours", self);
 
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
@@ -916,7 +1315,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
-    } else if (s && nvAccelIopFlip(fb, head, s, this)) {
+    } else if (s && nvAccelIopFlip(fb, head, s, self)) {
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
@@ -928,7 +1327,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if (P < 4 * W || (P & 3)) NVIOP_FAIL(kIOReturnBadArgument, "surface %llux%llu: row pitch %llu is under 4*W or not word-aligned", W, H, P);
         IOMemoryDescriptor *md = s->getMemoryDescriptor();
         if (!md) NVIOP_FAIL(kIOReturnNoMemory, "surface 0x%x has no memory descriptor", s->getSurfaceID());
-        src = (const volatile unsigned int *)iopMapSurface(s->getSurfaceID(), md, H * P);
+        src = (const volatile unsigned int *)nvpipe_iopMapSurface(self, s->getSurfaceID(), md, H * P);
         if (!src) NVIOP_FAIL(kIOReturnVMError, "surface 0x%x would not prepare/map %llu bytes", s->getSurfaceID(), H * P);
         w = (unsigned)W; h = (unsigned)H; pitch = (unsigned)P;
     } else {
@@ -947,10 +1346,37 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
-    for (unsigned y = 0; y < h; y++) {
-        const volatile unsigned int *sp = src + (unsigned long)y * spr;
-        volatile unsigned int *dp = d + (unsigned long)y * dpr;
-        for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+    /* b118: the copy is the whole cost of a frame on Intel (no flip yet, R2). It was a volatile 32-bit load/store loop
+       (16 MB per 2560x1600 frame, one word at a time into write-combined memory); now one memcpy per row (or one for the
+       frame when the pitches match), which uses the CPU's fast string copy. Boot-arg nmxslowcopy=1 restores the loop.
+       The time of every copy is counted: debug.nvaccel_iop_copy_ns (total), _copy_max_ns, _copies. */
+    IOLock *copyLock = nvIopCopyLock();
+    if (copyLock) IOLockLock(copyLock);
+    const uint64_t tc0 = mach_absolute_time();
+    if (!(nvIopFlipDbOn() && !fromRes && nvIopPresentFlip(fb, src, w, h, pitch)))
+        nvIopCopyRows(d, dpr, src, spr, words, h, pitch);
+    OSIncrementAtomic((volatile SInt32 *)&gIopGen);
+    IOSurface *settleOld = nullptr;
+    if (copyLock && gIopSettleOn && s && !fromRes) {          /* b123: copy this frame again once the screen is idle */
+        if (!gIopSettleCall) { struct thread_call *c = thread_call_allocate(&nvIopSettleFire, nullptr);
+                               if (c && !OSCompareAndSwapPtr(nullptr, c, (void *volatile *)&gIopSettleCall)) { /* lost a race: keep the first */ } }
+        if (gIopSettle.s != s) { settleOld = gIopSettle.s; ((OSObject *)s)->retain(); gIopSettle.s = s; }
+        gIopSettle.fb = fb; gIopSettle.head = head; gIopSettle.w = w; gIopSettle.h = h; gIopSettle.pitch = pitch;
+        gIopSettle.gen = gIopGen; gIopSettle.pass = 0;
+        if (gIopLateChk) {
+            const uint64_t tl = mach_absolute_time();
+            gIopSettle.sum = nvIopSum(src, spr, words, h); gIopSettle.sumWords = words;
+            OSAddAtomic64((SInt64)(mach_absolute_time() - tl), &gCntIopLateMs);
+        }
+        nvIopSettleArm(40);
+    }
+    if (copyLock) IOLockUnlock(copyLock);
+    if (settleOld) ((OSObject *)settleOld)->release();
+    {
+        const SInt64 dt = (SInt64)(mach_absolute_time() - tc0);
+        OSAddAtomic64(dt, &gCntIopCopyNs); OSAddAtomic64(1, &gCntIopCopies);
+        SInt64 m = gCntIopCopyMaxNs;
+        while (dt > m && !OSCompareAndSwap64((UInt64)m, (UInt64)dt, (volatile UInt64 *)&gCntIopCopyMaxNs)) m = gCntIopCopyMaxNs;
     }
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
@@ -970,6 +1396,40 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     }
     return kIOReturnSuccess;
 }
+
+IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn) { return nvpipe_performTransaction(this, txn); }
+#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+/*
+ * b146: tell the family the transaction is done. The copy (and the flip) finish inside performTransaction, but nothing
+ * raised the transaction interrupt afterwards, so IOAccelDisplayPipe only re-checked isTransactionComplete when something
+ * else woke it - the next transaction or event. WindowServer keeps one transaction in flight: the frame it composited
+ * next (the one with the newest typed character) waited for that check. That is "one update behind until the next key"
+ * (10-22/23: frames never change after they are shown; it happens only on the accelerated path). Off: sysctl
+ * debug.nvaccel_iop_txsig=0.
+ */
+extern "C" void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
+static struct thread_call *gIopTxSigCall;
+static void *volatile gIopTxSigPipe;
+static void nvIopTxSigFire(void *, void *)
+{
+    void *pipe = gIopTxSigPipe;
+    if (!pipe) return;
+    OSAddAtomic64(1, &gCntIopTxSig);
+    _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(pipe, nullptr);
+}
+IOReturn NMXDisplayPipeM::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+{
+    static SInt32 n; if (OSIncrementAtomic(&n) < 6) ALOG("iop: performTransaction on the MODERN pipe %p (b116)", this);
+    const IOReturn r = nvpipe_performTransaction(this, txn);
+    if (gIopTxSig && r == kIOReturnSuccess) {
+        if (!gIopTxSigCall) { struct thread_call *c = thread_call_allocate(&nvIopTxSigFire, nullptr);
+                              if (c && !OSCompareAndSwapPtr(nullptr, c, (void *volatile *)&gIopTxSigCall)) thread_call_free(c); }
+        gIopTxSigPipe = this;
+        if (gIopTxSigCall) thread_call_enter(gIopTxSigCall);   /* after we return: the family holds its gate in here */
+    }
+    return r;
+}
+#endif
 
 static int nvacceliop_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -1038,6 +1498,41 @@ NVACCEL_CNT(nvaccel_iop_empty,        gCntIopEmpty,       "K3: transactions with
 NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
 NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced from the IOSurface memory");
 NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
+NVACCEL_CNT(nvaccel_iop_copy_ns,      gCntIopCopyNs,      "b118: total ns spent copying frames to the panel");
+NVACCEL_CNT(nvaccel_iop_copy_max_ns,  gCntIopCopyMaxNs,   "b118: slowest single frame copy (ns)");
+NVACCEL_CNT(nvaccel_iop_copies,       gCntIopCopies,      "b118: frames copied (timed)");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_settle, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopSettleOn, 0, "b123: 1 = copy the last frame again 40 and 150 ms later (idle screen)");
+NVACCEL_CNT(nvaccel_iop_settles,      gCntIopSettle,      "b123: settle copies made");
+static int nvaccel_flipdb_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = nvIopFlipDbOn() ? 1 : 0;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    const int was = gIopFlipDb; gIopFlipDb = v ? 1 : 0;
+    if (was == 1 && !gIopFlipDb && NVAccel::gAccel) {
+        IOLock *L = nvIopCopyLock(); if (L) IOLockLock(L);
+        for (unsigned i = 0; i < kNvMaxFB; i++) nvIopFlipHome(NVAccel::gAccel->fFBs[i]);
+        nvIopFlipHome(NVAccel::gAccel->fFB);
+        if (L) IOLockUnlock(L);
+    }
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_iop_flipdb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, nvaccel_flipdb_sysctl, "I",
+            "b125: 1 = present frames by a page flip between two scan-out buffers at vblank, 0 = copy into the visible one");
+NVACCEL_CNT(nvaccel_iop_dbflips,      gCntIopDbFlips,     "b125: frames presented by a vblank page flip");
+NVACCEL_CNT(nvaccel_iop_dbflip_fail,  gCntIopDbFail,      "b125: flips refused (that frame was copied instead)");
+NVACCEL_CNT(nvaccel_iop_dbflip_ns,    gCntIopDbNs,        "b125: total ns in copy + flip (includes the wait for vblank)");
+NVACCEL_CNT(nvaccel_iop_settle_skip,  gCntIopSettleSkip,  "b123: settle copies skipped (a newer frame came, or no surface)");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_txsig, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopTxSig, 0, "b146: 1 = raise the transaction interrupt after every transaction");
+NVACCEL_CNT(nvaccel_iop_txsigs, gCntIopTxSig, "b146: transaction interrupts raised");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_wakefix, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxWakeFix, 0, "b132: 1 = finish a display-mode change left open by sleep, after the wake");
+NVACCEL_CNT(nvaccel_wakefixes, gCntNmxWakeFixes, "b132: display-mode changes finished after a wake");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_latechk, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopLateChk, 0, "b129: 1 = checksum each frame and count frames that change after they were shown");
+NVACCEL_CNT(nvaccel_iop_late40,   gCntIopLate[0], "b129: frames that changed within 40 ms after they were shown");
+NVACCEL_CNT(nvaccel_iop_late190,  gCntIopLate[1], "b129: ... between 40 and 190 ms");
+NVACCEL_CNT(nvaccel_iop_late440,  gCntIopLate[2], "b129: ... between 190 and 440 ms");
+NVACCEL_CNT(nvaccel_iop_late1040, gCntIopLate[3], "b129: ... between 440 and 1040 ms");
+NVACCEL_CNT(nvaccel_iop_latechk_ns, gCntIopLateMs, "b129: total time spent on the per-frame checksum");
 static int    gIopFlip = 0;
 static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
@@ -1062,16 +1557,23 @@ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
 SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crc_sysctl, "I",
             "b85k-crc: display CRC32 of what head nvaccel_crc_head is showing (0 = unavailable)");
 static bool gSysctlInstalled = false;
+#ifdef NMX_ACCEL
+static bool gSysctlHeadlessInstalled = false;
+#endif
 static void nvaccelInstallSysctl(void)
 {
     if (gSysctlInstalled) return;
 #ifdef NMX_ACCEL
     // only this one: the NVIDIA accelerator may be loaded too, and owns the debug.nvaccel* names
-    sysctl_register_oid(&sysctl__debug_nmxaccel_headless);
-    gSysctlInstalled = true;
+    if (!gSysctlHeadlessInstalled) { sysctl_register_oid(&sysctl__debug_nmxaccel_headless); gSysctlHeadlessInstalled = true; }
+    // b75 (WindowServer acceleration on Intel, boot-arg nmxws=1): this accelerator drives the display, so it takes the
+    // display controls (debug.nvaccelfb, debug.nvaccel_iop, ...) - only safe with no NVIDIA accelerator loaded
+    if (!gNmxWs) return;
+    ALOG("nmxws=1: display controls installed (debug.nvaccelfb=1 registers NMXGPUFB, debug.nvaccel_iop=1 opens the pipe)");
 #else
-    sysctl_register_oid(&sysctl__debug_nvaccelfb);
     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
+#endif
+    sysctl_register_oid(&sysctl__debug_nvaccelfb);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_refused);
@@ -1083,6 +1585,17 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_ns);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_max_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_copies);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_settle);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_settles);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_settle_skip);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_txsig); sysctl_register_oid(&sysctl__debug_nvaccel_iop_txsigs);
+    sysctl_register_oid(&sysctl__debug_nvaccel_wakefix);  sysctl_register_oid(&sysctl__debug_nvaccel_wakefixes);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_latechk);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_late40);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_late190);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_late440);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_late1040); sysctl_register_oid(&sysctl__debug_nvaccel_iop_latechk_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_flipdb);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_dbflips);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_dbflip_fail); sysctl_register_oid(&sysctl__debug_nvaccel_iop_dbflip_ns);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
@@ -1098,7 +1611,6 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
     gSysctlInstalled = true;
     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
-#endif
 }
 
 static inline void nvAccelZero(void *p, unsigned long n)
@@ -1620,6 +2132,16 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
 }
 
 static unsigned nvVaAllocLogged, nvVaMapLogged;
+#ifdef NMX_ACCEL
+// AMD/Intel have no NVIDIA RM to hand out GPU addresses. The IOAccel family still wants one for every memory map it
+// makes (WindowServer's 2560x1600 surfaces were refused and the screen stayed black), but nothing ever runs NVIDIA
+// commands against it: Vulkan/ANV gets its own addresses from i915 through NMXGPU. So these are private, unique
+// placeholder addresses from one locked range allocator.
+#define NMX_VA_BASE  0x0000100000000000ull
+#define NMX_VA_SIZE  0x0000010000000000ull   // 1 TB of placeholder space
+static IORangeAllocator *gNmxVa;
+static unsigned gNmxVaLogged;
+#endif
 
 static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map,
                                             unsigned long long len, unsigned long long align)
@@ -1627,6 +2149,26 @@ static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map,
     NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
     if (!mm || !len) return 0;
     if (mm->fGpuVa) return mm->fGpuVa;
+#ifdef NMX_ACCEL
+    {
+        if (!gNmxVa) {
+            IORangeAllocator *ra = IORangeAllocator::withRange(NMX_VA_SIZE, 0x10000, 0, IORangeAllocator::kLocking);
+            if (ra && !OSCompareAndSwapPtr(nullptr, ra, (void * volatile *)&gNmxVa)) ra->release();
+            if (!gNmxVa) { ALOG("gpuVaAlloc: no placeholder VA allocator"); return 0; }
+        }
+        const unsigned long long a = align > 0x10000 ? align : 0x10000;
+        const unsigned long long sz = (len + 0xffffull) & ~0xffffull;
+        IORangeScalar off = 0;
+        if (!gNmxVa->allocate(sz, &off, a)) {
+            if (gNmxVaLogged < 8) { gNmxVaLogged++; ALOG("gpuVaAlloc: placeholder VA space full (%llu bytes)", len); }
+            return 0;
+        }
+        mm->fNmxPrivate = true; mm->fGpuVa = NMX_VA_BASE + off; mm->fVaLen = sz;
+        if (gNmxVaLogged < 8) { gNmxVaLogged++;
+            ALOG("gpuVaAlloc: %llu bytes -> placeholder VA 0x%llx (AMD/Intel: no RM page tables)", len, mm->fGpuVa); }
+        return mm->fGpuVa;
+    }
+#endif
 
     struct NVRMRmHandles h;
     if (!nvAccelRmHandles(&h)) return 0;
@@ -1650,6 +2192,14 @@ static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map,
 static void nvAccelGpuVaFree(IOAccelMemoryMap *map)
 {
     NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
+#ifdef NMX_ACCEL
+    if (mm && mm->fNmxPrivate) {
+        if (gNmxVa && mm->fGpuVa >= NMX_VA_BASE) gNmxVa->deallocate(mm->fGpuVa - NMX_VA_BASE, mm->fVaLen);
+        OSAddAtomic64(1, &gCntMapFree);
+        mm->fNmxPrivate = false; mm->fGpuVa = 0; mm->fVaLen = 0; mm->fMapped = false;
+        return;
+    }
+#endif
     if (!mm || !mm->fHVirt) return;
     struct NVRMRmHandles h;
     if (!nvAccelRmHandles(&h)) return;
@@ -1667,6 +2217,9 @@ static void nvAccelGpuVaFree(IOAccelMemoryMap *map)
 bool NVMemoryMap::commitIntoGPUPageTable()
 {
     if (fMapped) return true;
+#ifdef NMX_ACCEL
+    if (fNmxPrivate) { fMapped = true; OSAddAtomic64(1, &gCntMapCommit); return true; }   // nothing to map: no RM
+#endif
     NVVidMemory *vm = OSDynamicCast(NVVidMemory, fMem);
     void *kapiMem = vm ? vm->fRmHandle : nullptr;
     unsigned long long len = fVaLen ? fVaLen : getLength();
@@ -1701,6 +2254,9 @@ bool NVMemoryMap::commitIntoGPUPageTable()
 
 void NVMemoryMap::releaseFromGPUPageTable()
 {
+#ifdef NMX_ACCEL
+    if (fNmxPrivate) { fMapped = false; return; }
+#endif
     if (!fMapped || !fHVirt) return;
     struct NVRMRmHandles h;
     if (!nvAccelRmHandles(&h)) return;
@@ -1818,7 +2374,12 @@ static unsigned nvFlipWhy = 0;
 static unsigned nvScanoutCopies = 0;
 static bool nvAccelCopyToScanout(IOAccelResource2 *res)
 {
+#ifndef NMX_ACCEL
     if (nvScanoutCopies >= NVSCANOUT_COPY_MAX) return false;
+#endif
+    // b91 (10-19): no cap on Intel. This copy IS the desktop there (WindowServer's frame -> the panel), and the 120-frame
+    // debugging cap froze the screen ~7 s after the armed lock screen came up (WindowServer kept drawing: 7642
+    // copy-forward attempts while the panel held frame #120).
     if (!res) return false;
     NVAccel *a = NVAccel::gAccel;
     if (!a || !a->fFB) { NVFLIPWHY("copyToScanout: no accelerator/framebuffer"); return false; }
@@ -1848,13 +2409,22 @@ static bool nvAccelCopyToScanout(IOAccelResource2 *res)
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     const volatile unsigned int *s = (const volatile unsigned int *)vm->fKva;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
+#ifdef NMX_ACCEL
+    for (unsigned y = 0; y < rows; y++)   // b91: whole rows at once (cached RAM -> write-combined scan-out)
+        memcpy((void *)(d + (unsigned long)y * dpr), (const void *)(s + (unsigned long)y * spr), (size_t)words * 4);
+#else
     for (unsigned y = 0; y < rows; y++) {
         const volatile unsigned int *sp = s + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
     }
+#endif
     nvScanoutCopies++;
+#ifdef NMX_ACCEL
+    if (nvScanoutCopies <= 3)
+#else
     if (nvScanoutCopies <= 3 || nvScanoutCopies == NVSCANOUT_COPY_MAX)
+#endif
         ALOG("*** COPIED THE COMPOSITED FRAME ONTO THE PANEL *** #%u: %ux%u, %u rows x %u bytes, "
              "src kva %p pitch %u -> scanout kva %p phys 0x%llx pitch %u%s",
              nvScanoutCopies, w, h, rows, rowb, vm->fKva, pitch, q.kva,
@@ -1862,6 +2432,94 @@ static bool nvAccelCopyToScanout(IOAccelResource2 *res)
              nvScanoutCopies == NVSCANOUT_COPY_MAX ? "  [CAP REACHED -- stopping, panel keeps this frame]" : "");
     return true;
 }
+
+#ifdef NMX_ACCEL
+// b93 (10-19): the Intel desktop's real front buffer is the framebuffer resource - since b92 a shadow in RAM (swap
+// argument a1). WindowServer composites into a back buffer (a2), "swaps" it into a1, and then draws the SOFTWARE CURSOR
+// straight into a1 (NMXGPUFB has no hardware cursor), saving and restoring the pixels under it. b91/b92 copied a2 to the
+// panel and never showed a1: the cursor's save-under/restore fought the copy - multiple ghost cursors and flicker
+// (10-19 photos). Now: a2 -> a1 on every swap, and a1 -> panel on every swap AND ~60 times a second (cursor moves need no
+// swap), so the panel shows exactly what WindowServer believes the screen holds.
+static IOLock *gNmxPresLock = nullptr;
+static struct { void *kva; unsigned w, h, pitch; } gNmxShadow;
+static struct thread_call *gNmxPresCall = nullptr;
+static volatile SInt64 gNmxPresSwaps, gNmxPresTicks;
+static void nmxCopyRows(void *d, unsigned dp, const void *s, unsigned sp, unsigned rowBytes, unsigned rows)
+{
+    for (unsigned y = 0; y < rows; y++)
+        memcpy((uint8_t *)d + (size_t)y * dp, (const uint8_t *)s + (size_t)y * sp, rowBytes);
+}
+static void nmxShadowToPanelLocked()
+{
+    NVAccel *a = NVAccel::gAccel;
+    if (!a || !gNmxShadow.kva) return;
+    struct NVRMVramRequest q;
+    for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
+    q.version = NVRM_VRAM_ABI_VERSION;
+    if (a->askFramebufferForScanout(&q) != kIOReturnSuccess || !q.kva || !q.pitch) return;
+    const unsigned rows = gNmxShadow.h < q.height ? gNmxShadow.h : q.height;
+    const unsigned w = gNmxShadow.w < q.width ? gNmxShadow.w : q.width;
+    unsigned rb = w * 4; if (rb > gNmxShadow.pitch) rb = gNmxShadow.pitch; if (rb > q.pitch) rb = q.pitch;
+    nmxCopyRows(q.kva, q.pitch, gNmxShadow.kva, gNmxShadow.pitch, rb & ~3u, rows);
+}
+static void nmxPresentTick(void *, void *)
+{
+    if (gNmxPresLock && gNvIop) {
+        IOLockLock(gNmxPresLock);
+        if (gNmxShadow.kva) { nmxShadowToPanelLocked(); OSAddAtomic64(1, &gNmxPresTicks); }
+        IOLockUnlock(gNmxPresLock);
+    }
+    uint64_t when = 0; clock_interval_to_deadline(16, kMillisecondScale, &when);
+    if (gNmxPresCall) thread_call_enter_delayed(gNmxPresCall, when);
+}
+// returns true when the frame was presented through the shadow (else the caller keeps the old copy path)
+bool nmxSwapPresent(IOAccelResource2 *a1, IOAccelResource2 *a2)
+{
+    /* b94: the b93 front-buffer present path is opt-in (boot-arg nmxpresent=1). b94 gives NMXGPUFB a hardware cursor,
+       so WindowServer no longer draws the pointer into the front buffer and the b92 copy path is the default again. */
+    static int sOn = -1;
+    if (sOn < 0) { int v = 0; sOn = (PE_parse_boot_argn("nmxpresent", &v, sizeof v) && v) ? 1 : 0;
+                   IOLog("NMXAccel: present path %s\n", sOn ? "ON (b93 front buffer, nmxpresent=1)" : "off (b92 copy; nmxpresent=1 turns it on)"); }
+    if (!sOn) return false;
+    if (!gNmxPresLock) { IOLock *l = IOLockAlloc(); if (!l) return false; if (!OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gNmxPresLock)) IOLockFree(l); }
+    NVVidMemory *vm1 = nvres_vidmem(a1);
+    if (!vm1 || !vm1->fKva || vm1->fScanout) return false;
+    const unsigned char *r1 = (const unsigned char *)a1;
+    const unsigned w1 = *(const volatile unsigned short *)(r1 + 0xb0), h1 = *(const volatile unsigned short *)(r1 + 0xb2);
+    const unsigned p1 = *(const volatile unsigned int *)(r1 + 0xb8);
+    if (!w1 || !h1 || p1 < 4 * w1 || (unsigned long long)p1 * h1 > vm1->fBytes) return false;
+    IOLockLock(gNmxPresLock);
+    NVVidMemory *vm2 = a2 ? nvres_vidmem(a2) : nullptr;
+    if (vm2 && vm2->fKva && vm2 != vm1) {
+        const unsigned char *r2 = (const unsigned char *)a2;
+        const unsigned w2 = *(const volatile unsigned short *)(r2 + 0xb0), h2 = *(const volatile unsigned short *)(r2 + 0xb2);
+        const unsigned p2 = *(const volatile unsigned int *)(r2 + 0xb8);
+        if (w2 && h2 && p2 >= 4 * w2 && (unsigned long long)p2 * h2 <= vm2->fBytes) {
+            const unsigned w = w2 < w1 ? w2 : w1, h = h2 < h1 ? h2 : h1;
+            nmxCopyRows(vm1->fKva, p1, vm2->fKva, p2, w * 4, h);
+        }
+    }
+    gNmxShadow.kva = vm1->fKva; gNmxShadow.w = w1; gNmxShadow.h = h1; gNmxShadow.pitch = p1;
+    nmxShadowToPanelLocked();
+    IOLockUnlock(gNmxPresLock);
+    const SInt64 n = OSAddAtomic64(1, &gNmxPresSwaps);
+    if (n < 3) ALOG("present: swap #%lld through the RAM shadow %ux%u pitch %u (a2 %s) -> panel; refresh timer %s", (long long)n + 1,
+                    w1, h1, p1, (vm2 && vm2->fKva) ? "copied in" : "none", gNmxPresCall ? "running" : "starting");
+    if (!gNmxPresCall) {
+        struct thread_call *c = thread_call_allocate(&nmxPresentTick, nullptr);
+        if (c && OSCompareAndSwapPtr(nullptr, c, (void *volatile *)&gNmxPresCall)) nmxPresentTick(nullptr, nullptr);
+    }
+    return true;
+}
+// called before a vidmem's memory goes away: the timer must never copy from freed pages
+void nmxShadowForget(void *kva)
+{
+    if (!gNmxPresLock || !kva) return;
+    IOLockLock(gNmxPresLock);
+    if (gNmxShadow.kva == kva) gNmxShadow.kva = nullptr;
+    IOLockUnlock(gNmxPresLock);
+}
+#endif
 
 static bool nvAccelFlipTo(IOAccelResource2 *res)
 {
@@ -1913,3 +2571,357 @@ IOReturn NVAccel::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, 
 }
 
 NM_TAHOE_FWD_DEFS
+
+#ifdef NMX_ACCEL
+/* b98: frame timing, one log line per second while WindowServer swaps (no line in an idle second). The lag of 10-20 had
+   no busy process in two spindumps, so this measures what reaches the panel: swaps per second, the CPU copy's time,
+   and the longest gap between two swaps in that second. */
+static IOSimpleLock *gNmxStatLock;
+static unsigned long long gNmxStatWin, gNmxStatLast, gNmxStatMaxGap, gNmxStatSum, gNmxStatMax;
+static unsigned gNmxStatN, gNmxStatCopied, gNmxStatLines;
+static volatile SInt64 gCntCfOk, gCntCfFail, gCntCfPx, gCntStaleSkip;
+void nmxSwapStat(unsigned long long t0, unsigned long long t1, bool copied)
+{
+    if (!gNmxStatLock) { IOSimpleLock *l = IOSimpleLockAlloc(); if (!l) return; if (!OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gNmxStatLock)) IOSimpleLockFree(l); }
+    char line[400]; line[0] = 0;
+    IOSimpleLockLock(gNmxStatLock);
+    if (gNmxStatWin && t0 - gNmxStatWin >= 1000000000ull && gNmxStatN) {
+        snprintf(line, sizeof line, "frames: %u in %llu ms, copied %u, copy avg %llu us max %llu us, longest gap %llu ms | pipe vbl %d/%d tx %d/%d begin %d signal %d submit %d TIMEOUTS %d | copyfwd ok %lld fail %lld | b113 back buffers synced %lld",
+                 gNmxStatN, (t0 - gNmxStatWin) / 1000000ull, gNmxStatCopied, gNmxStatSum / gNmxStatN / 1000ull,
+                 gNmxStatMax / 1000ull, gNmxStatMaxGap / 1000000ull,
+                 (int)gNmxPipeCnt[kPipeVblOn], (int)gNmxPipeCnt[kPipeVblOff], (int)gNmxPipeCnt[kPipeTxOn], (int)gNmxPipeCnt[kPipeTxOff],
+                 (int)gNmxPipeCnt[kPipeBegin], (int)gNmxPipeCnt[kPipeSignal], (int)gNmxPipeCnt[kPipeSubmit], (int)gNmxPipeCnt[kPipeTimeout],
+                 (long long)gCntCfOk, (long long)gCntCfFail, (long long)gCntStaleSkip);
+        gNmxStatN = gNmxStatCopied = 0; gNmxStatSum = gNmxStatMax = gNmxStatMaxGap = 0;
+        gNmxStatWin = t0;
+    }
+    if (!gNmxStatWin || t0 - gNmxStatWin >= 5000000000ull) { gNmxStatWin = t0; gNmxStatN = gNmxStatCopied = 0; gNmxStatSum = gNmxStatMax = gNmxStatMaxGap = 0; }
+    if (gNmxStatLast && t0 > gNmxStatLast && gNmxStatN && t0 - gNmxStatLast > gNmxStatMaxGap) gNmxStatMaxGap = t0 - gNmxStatLast;
+    gNmxStatLast = t0;
+    const unsigned long long d = t1 > t0 ? t1 - t0 : 0;
+    gNmxStatN++; if (copied) gNmxStatCopied++; gNmxStatSum += d; if (d > gNmxStatMax) gNmxStatMax = d;
+    IOSimpleLockUnlock(gNmxStatLock);
+    if (line[0] && gNmxStatLines < 3000) { gNmxStatLines++; ALOG("%s", line); }
+}
+
+/* b107: copy forward (see NVSurface::submitCopyForward). The resource geometry is read where the swap code reads it
+   (width +0xb0, height +0xb2, pitch +0xb8); the bounds are IOAccelBounds {int16 x, y, w, h} in pixels, 4 bytes each. */
+static IOAccelResource2 *volatile gNmxFront = nullptr;     // the buffer last copied to the panel (swap a2 normally)
+static IOAccelResource2 *volatile gNmxSwapA1 = nullptr;    // the swap's a1: the family's FRONT buffer
+static volatile SInt32 gNmxCfLogs = 0;
+static int nmxCopyFwdOff()
+{
+    /* b108: OPT-IN while it is proven (b107 had it on by default and froze the login screen with stale pixels).
+       boot-arg nmxcopyfwd=1 turns it on; without it (or with nmxnocopyfwd=1) the family default answers unsupported,
+       exactly as b106 and earlier. */
+    static int off = -1;
+    if (off < 0) { int on = 0, no = 0;
+                   PE_parse_boot_argn("nmxcopyfwd", &on, sizeof on); PE_parse_boot_argn("nmxnocopyfwd", &no, sizeof no);
+                   off = (on && !no) ? 0 : 1;
+                   ALOG("copyfwd: %s", off ? "OFF (default; boot-arg nmxcopyfwd=1 turns it on) - unsupported, as b106"
+                                           : "ON (nmxcopyfwd=1, b108)"); }
+    return off;
+}
+static bool nmxResGeom(IOAccelResource2 *r, NVVidMemory **vm, unsigned *w, unsigned *h, unsigned *pitch);
+/* b108: b107 froze the login screen with old pixels around the cursor (10-20 photo). In the family's model the swap's a1
+   is the FRONT buffer and copy forward copies FROM it; our swap copied a2 to the panel and never into a1, so a1 held a
+   stale picture, and b107 copied from it when neither argument was the buffer last shown. Now the swap also keeps a1
+   equal to what the panel shows (a2 -> a1, one more ~1 ms copy, only while copy forward is on), so the front buffer
+   is current whichever argument copy forward names. */
+void nmxNoteFront(IOAccelResource2 *res) { gNmxFront = res; }
+/* b109: the swap trace (10-20 18:49, 186 swaps on one surface) showed every update as
+       copyfwd a1 -> B1, swap(a1, B1), and 2 ms later swap(a1, B2)
+   B2 never receives a copy forward and is never drawn into: it still held the LOCK SCREEN from before login, and the
+   panel showed it 2 ms after every real frame - the flicker between the desktop and the old lock screen. (b106 skipped
+   B2 only because it was all zero then: nvAccelResHasContent said "empty".) A back buffer is therefore shown only if it
+   is NEW: it was the target of the last copy forward, or its pixels changed since it was last shown (a whole-screen
+   redraw needs no copy forward). Otherwise the panel keeps the last real frame. Only while copy forward is on. */
+/* b110: b109 also compared a 48 x 48 pixel sample to spot buffers that changed without a copy forward. That missed small
+   changes: a Dock label going away is redrawn into B1 WITHOUT a copy forward (its old area is covered by the new
+   damage), the sample did not change, the frame was skipped, a1 kept the label and copy forward kept copying it back -
+   every label the pointer passed over stayed on screen (10-20 19:07 photo). The trace's real rule is simpler: B2 is
+   NEVER a copy-forward target, B1 is one all the time. So: once copy forward is running, a back buffer that has never
+   been its target is the unused second buffer and is not shown; every buffer that has been a target is always shown,
+   however small its change. If no copy forward has happened for 1 s (whole-screen redraws only), everything is shown. */
+enum { kNmxCfSlots = 8 };
+static IOAccelResource2 *volatile gNmxCfSeen[kNmxCfSlots];
+static unsigned gNmxCfSeenNext;
+static volatile uint64_t gNmxCfLastAbs;
+static void nmxNoteCfTarget(IOAccelResource2 *res)
+{
+    gNmxCfLastAbs = mach_absolute_time();
+    for (unsigned i = 0; i < kNmxCfSlots; i++) if (gNmxCfSeen[i] == res) return;
+    gNmxCfSeen[gNmxCfSeenNext++ % kNmxCfSlots] = res;
+}
+/* b111: b110 showed every buffer again after 1 s without a copy forward - sitting still was enough for the unused
+   buffer (the old lock screen) to reach the panel, and the lazy a1 sync then copied that picture into the real buffer:
+   the lock screen came back with the desktop showing through only where something was redrawn (10-21 03:33). No timer
+   now: once copy forward has run, a buffer that was never its target is never shown and never becomes a copy source.
+   The list starts over only when the surface gets a different front buffer (a1) - the buffers were rebuilt. */
+static IOAccelResource2 *volatile gNmxCfSurfA1 = nullptr;
+static bool nmxIsCfTarget(IOAccelResource2 *r)
+{
+    for (unsigned i = 0; i < kNmxCfSlots; i++) if (gNmxCfSeen[i] == r) return true;
+    return false;
+}
+void nmxSwapNoteA1(IOAccelResource2 *a1)
+{
+    if (!a1 || a1 == gNmxCfSurfA1) return;
+    if (gNmxCfSurfA1) {
+        for (unsigned i = 0; i < kNmxCfSlots; i++) gNmxCfSeen[i] = nullptr;
+        gNmxCfLastAbs = 0;
+        ALOG("swap: new front buffer %p (was %p) - the buffers were rebuilt, copy-forward targets start over (b111)", a1, gNmxCfSurfA1);
+    }
+    gNmxCfSurfA1 = a1;
+}
+bool nmxSwapIsStale(IOAccelResource2 *a2)
+{
+    if (!a2 || nmxCopyFwdOff() || !gNmxCfLastAbs) return false;
+    if (nmxIsCfTarget(a2)) return false;
+    const SInt64 n = OSAddAtomic64(1, &gCntStaleSkip);
+    if (n < 6) ALOG("swap: back buffer %p has never received a copy forward (the unused second buffer) - NOT shown, "
+                    "the panel keeps the last real frame (b111)", a2);
+    return true;
+}
+/* b110 (lag): the a2 -> a1 copy is made only when copy forward actually needs a1 as its source for a buffer that is not
+   already the picture on the panel. On this Mac every copy forward goes into the buffer shown last (the trace: B1 each
+   time), which already holds everything outside the new damage - so neither copy is needed and a frame costs one full
+   copy (to the panel) instead of three. */
+static IOAccelResource2 *volatile gNmxA1Pending = nullptr;
+static void nmxSyncFront(IOAccelResource2 *a1, IOAccelResource2 *shown);
+void nmxSwapKeepFront(IOAccelResource2 *a1, IOAccelResource2 *shown)
+{
+    if (!a1) return;
+    gNmxSwapA1 = a1;
+    if (nmxCopyFwdOff() || !shown || shown == a1) return;
+    if (nmxIsCfTarget(shown) || !gNmxCfLastAbs) gNmxA1Pending = shown;   /* a1 is behind the panel by this buffer; synced lazily */
+}
+static void nmxSyncFront(IOAccelResource2 *a1, IOAccelResource2 *shown)
+{
+    if (!a1 || !shown || shown == a1) return;
+    NVVidMemory *vf = nullptr, *vs = nullptr; unsigned wf, hf, pf, ws, hs, ps;
+    if (!nmxResGeom(a1, &vf, &wf, &hf, &pf) || !nmxResGeom(shown, &vs, &ws, &hs, &ps) || vf == vs) return;
+    const unsigned w = wf < ws ? wf : ws, h = hf < hs ? hf : hs;
+    for (unsigned y = 0; y < h; y++)
+        memcpy((uint8_t *)vf->fKva + (size_t)y * pf, (const uint8_t *)vs->fKva + (size_t)y * ps, (size_t)w * 4);
+}
+struct NmxBounds { int16_t x, y, w, h; };
+static bool nmxResGeom(IOAccelResource2 *r, NVVidMemory **vm, unsigned *w, unsigned *h, unsigned *pitch)
+{
+    NVVidMemory *m = r ? nvres_vidmem(r) : nullptr;
+    if (!m || !m->fKva) return false;
+    const unsigned char *rr = (const unsigned char *)r;
+    *w = *(const volatile unsigned short *)(rr + 0xb0); *h = *(const volatile unsigned short *)(rr + 0xb2);
+    *pitch = *(const volatile unsigned int *)(rr + 0xb8);
+    if (!*w || !*h || *pitch < 4 * *w || (unsigned long long)*pitch * *h > m->fBytes) return false;
+    *vm = m; return true;
+}
+static IOReturn nmxCopyForwardSync(unsigned int mode, IOAccelResource2 *a, IOAccelResource2 *b, const void *bounds, unsigned int n);
+static int nmxSyncModeOff();
+IOReturn nmxCopyForward(unsigned int mode, IOAccelResource2 *a, IOAccelResource2 *b, const void *bounds, unsigned int n)
+{
+    if (nmxCopyFwdOff()) return kIOReturnUnsupported;
+    if (!nmxSyncModeOff()) return nmxCopyForwardSync(mode, a, b, bounds, n);   /* b113 */
+    NVVidMemory *va = nullptr, *vb = nullptr; unsigned wa = 0, ha = 0, pa = 0, wb = 0, hb = 0, pb = 0;
+    const bool ga = nmxResGeom(a, &va, &wa, &ha, &pa), gb = nmxResGeom(b, &vb, &wb, &hb, &pb);
+    if (!ga || !gb) {
+        OSAddAtomic64(1, &gCntCfFail);
+        if (OSIncrementAtomic(&gNmxCfLogs) < 12)
+            ALOG("copyfwd: mode 0x%x a %p (%s) b %p (%s) - a buffer without memory/geometry, answering unsupported as before",
+                 mode, a, ga ? "ok" : "NO", b, gb ? "ok" : "NO");
+        return kIOReturnUnsupported;
+    }
+    if (va == vb) return kIOReturnSuccess;
+    /* source = a buffer known to hold the picture on the panel: the family's front buffer (swap a1, kept current by
+       nmxSwapKeepFront) or the buffer last copied to the panel. Neither argument known: no guess (b107 guessed and
+       pasted a stale picture) - answer unsupported as before, CoreDisplay then redraws that region itself. */
+    IOAccelResource2 *front = gNmxFront, *fa1 = gNmxSwapA1; const char *why;
+    bool aSrc;
+    if (a == fa1 && b != fa1)        { aSrc = true;  why = "a = front buffer (swap a1)"; }
+    else if (b == fa1 && a != fa1)   { aSrc = false; why = "b = front buffer (swap a1)"; }
+    else if (a == front && b != front) { aSrc = true;  why = "a = last on the panel"; }
+    else if (b == front && a != front) { aSrc = false; why = "b = last on the panel"; }
+    else {
+        OSAddAtomic64(1, &gCntCfFail);
+        if (OSIncrementAtomic(&gNmxCfLogs) < 24)
+            ALOG("copyfwd: mode 0x%x a %p b %p - neither is the front buffer (a1 %p) nor the last shown (%p): unsupported",
+                 mode, a, b, fa1, front);
+        return kIOReturnUnsupported;
+    }
+    IOAccelResource2 *dstRes = aSrc ? b : a, *srcRes = aSrc ? a : b;
+    if (!gNmxCfLastAbs) {
+        /* b111: the FIRST copy forward (also the first after the buffers were rebuilt). Which back buffer is real is
+           known only from now on, and a1 may still hold whatever the unused buffer showed (the lock screen): copying
+           from it would plant that picture in the real buffer for good. The destination already holds WindowServer's
+           own last frame, so nothing is copied, and anything queued for a1 is dropped. */
+        gNmxA1Pending = nullptr;
+        OSAddAtomic64(1, &gCntCfOk); nmxNoteCfTarget(dstRes);
+        ALOG("copyfwd: first one into %p - nothing copied, it becomes the real back buffer (b111)", dstRes);
+        return kIOReturnSuccess;
+    }
+    if (dstRes == gNmxFront) {   /* b110: the destination IS the picture on the panel - nothing to copy */
+        OSAddAtomic64(1, &gCntCfOk); nmxNoteCfTarget(dstRes);
+        return kIOReturnSuccess;
+    }
+    if (srcRes == fa1 && gNmxA1Pending) { nmxSyncFront(fa1, gNmxA1Pending); gNmxA1Pending = nullptr; }
+    NVVidMemory *vs = aSrc ? va : vb, *vd = aSrc ? vb : va;
+    const unsigned ps = aSrc ? pa : pb, pd = aSrc ? pb : pa;
+    const unsigned W = wa < wb ? wa : wb, H = ha < hb ? ha : hb;
+    const NmxBounds whole = { 0, 0, (int16_t)(W > 32767 ? 32767 : W), (int16_t)(H > 32767 ? 32767 : H) };
+    const NmxBounds *bb = (bounds && n) ? (const NmxBounds *)bounds : &whole;
+    const unsigned cnt = (bounds && n) ? (n > 4096 ? 4096 : n) : 1;
+    unsigned long long px = 0;
+    for (unsigned i = 0; i < cnt; i++) {
+        int x0 = bb[i].x, y0 = bb[i].y, x1 = x0 + bb[i].w, y1 = y0 + bb[i].h;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > (int)W) x1 = (int)W;
+        if (y1 > (int)H) y1 = (int)H;
+        if (x1 <= x0 || y1 <= y0) continue;
+        const size_t rb = (size_t)(x1 - x0) * 4;
+        for (int y = y0; y < y1; y++)
+            memcpy((uint8_t *)vd->fKva + (size_t)y * pd + (size_t)x0 * 4, (const uint8_t *)vs->fKva + (size_t)y * ps + (size_t)x0 * 4, rb);
+        px += (unsigned long long)(x1 - x0) * (unsigned long long)(y1 - y0);
+    }
+    OSAddAtomic64(1, &gCntCfOk); OSAddAtomic64((SInt64)px, &gCntCfPx);
+    nmxNoteCfTarget(aSrc ? b : a);
+    if (OSIncrementAtomic(&gNmxCfLogs) < 24)
+        ALOG("copyfwd: mode 0x%x %u rect(s)%s, first %d,%d %dx%d - %s -> %s (%s; a %p b %p a1 %p shown %p), %ux%u, %llu px",
+             mode, cnt, (bounds && n) ? "" : " (none given: whole buffer)", bb[0].x, bb[0].y, bb[0].w, bb[0].h,
+             aSrc ? "a" : "b", aSrc ? "b" : "a", why, a, b, fa1, front, W, H, px);
+    return kIOReturnSuccess;
+}
+/* b113 - the lock screen (10-21 photo: clock missing, the date cut off at the baseline, the unlock spinner a black
+   square; armed only, also with nmx-ws-arm.sh). b109-b111 decided which back buffer is "real" by a rule (a buffer that
+   never received a copy forward is the unused one and is never shown). That rule came from a desktop trace. On the lock
+   screen WindowServer draws into the OTHER buffer (b108: B2 held the lock screen) - with b111 those frames never reached
+   the panel, and after a buffer rebuild the first copy forward copied nothing, so a new (all-zero) buffer showed black
+   wherever it was not redrawn.
+   Now no guessing at all: every swap shows its back buffer, and right after that the same picture is copied into every
+   other back buffer of the desktop. So whichever buffer WindowServer draws into next, everything it does not redraw
+   is already the latest picture: a buffer it leaves untouched shows the same frame again (no flicker), a buffer it
+   draws into shows its drawing (the lock screen clock, the spinner). Copy forward copies its rectangles from the last
+   shown frame. Buffers are tracked by their memory (kva) and forgotten when that memory is freed, so a rebuild can
+   never copy from freed pages. Cost: one more full-frame RAM copy per swap (~1 ms). boot-arg nmxsyncoff=1 = b111. */
+struct NmxBuf { uint8_t *kva; unsigned w, h, pitch; };
+enum { kNmxSyncSlots = 6 };
+static IOLock *gNmxSyncLock = nullptr;
+static NmxBuf gNmxLast;                       /* the frame on the panel (memory of the back buffer last shown) */
+static NmxBuf gNmxBacks[kNmxSyncSlots];       /* back buffers seen in swaps */
+static unsigned gNmxBackNext;
+static volatile SInt32 gNmxSyncLogs;
+static int nmxSyncModeOff()
+{
+    static int off = -1;
+    /* b115: OFF by default again. b113 did not fix the lock screen (that was framebuffer fetch, b114) and cost up to
+       four full-frame copies per screen update (show B1, sync B2, show B2, sync B1) - more typing delay for nothing.
+       boot-arg nmxsync=1 turns it back on. */
+    if (off < 0) { int v = 0; off = (PE_parse_boot_argn("nmxsync", &v, sizeof v) && v) ? 0 : 1;
+                   ALOG("swap: %s", off ? "b111 buffer rule (default; nmxsync=1 = b113 sync)" : "b113 every back buffer kept equal to the panel (nmxsync=1)"); }
+    return off;
+}
+static bool nmxSyncLockReady()
+{
+    if (gNmxSyncLock) return true;
+    IOLock *l = IOLockAlloc(); if (!l) return false;
+    if (!OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gNmxSyncLock)) IOLockFree(l);
+    return true;
+}
+static bool nmxBufOf(IOAccelResource2 *r, NmxBuf *o)
+{
+    NVVidMemory *vm = nullptr; unsigned w, h, p;
+    if (!nmxResGeom(r, &vm, &w, &h, &p) || vm->fScanout) return false;
+    o->kva = (uint8_t *)vm->fKva; o->w = w; o->h = h; o->pitch = p; return true;
+}
+static void nmxBufCopy(const NmxBuf &d, const NmxBuf &s)
+{
+    const unsigned w = d.w < s.w ? d.w : s.w, h = d.h < s.h ? d.h : s.h;
+    for (unsigned y = 0; y < h; y++) memcpy(d.kva + (size_t)y * d.pitch, s.kva + (size_t)y * s.pitch, (size_t)w * 4);
+}
+void nmxSyncForget(void *kva)
+{
+    if (!gNmxSyncLock || !kva) return;
+    IOLockLock(gNmxSyncLock);
+    if (gNmxLast.kva == kva) gNmxLast.kva = nullptr;
+    for (unsigned i = 0; i < kNmxSyncSlots; i++) if (gNmxBacks[i].kva == kva) gNmxBacks[i].kva = nullptr;
+    IOLockUnlock(gNmxSyncLock);
+}
+/* -1: not handled (copy forward off, nmxsyncoff=1, or a2 has no memory) - the caller keeps the old path; 0/1: copied */
+int nmxSwapSync(IOAccelResource2 *a1, IOAccelResource2 *a2)
+{
+    if (nmxCopyFwdOff() || nmxSyncModeOff() || !a2 || a2 == a1 || !nmxSyncLockReady()) return -1;
+    NmxBuf b;
+    if (!nmxBufOf(a2, &b)) return -1;
+    IOLockLock(gNmxSyncLock);
+    const bool copied = nvAccelCopyToScanout(a2);
+    unsigned synced = 0; bool known = false;
+    if (copied) {
+        for (unsigned i = 0; i < kNmxSyncSlots; i++) {
+            NmxBuf &o = gNmxBacks[i];
+            if (!o.kva) continue;
+            if (o.kva == b.kva) { known = true; continue; }
+            if (o.w != b.w || o.h != b.h) continue;      /* another size: an old desktop mode, left alone */
+            nmxBufCopy(o, b); synced++;
+        }
+        if (!known) {   /* a new back buffer: take a free slot, else the oldest */
+            unsigned slot = kNmxSyncSlots;
+            for (unsigned i = 0; i < kNmxSyncSlots; i++) if (!gNmxBacks[i].kva) { slot = i; break; }
+            if (slot == kNmxSyncSlots) slot = gNmxBackNext++ % kNmxSyncSlots;
+            gNmxBacks[slot] = b;
+        }
+        gNmxLast = b;
+    }
+    IOLockUnlock(gNmxSyncLock);
+    if (copied) { nmxNoteFront(a2); gNmxSwapA1 = a1; OSAddAtomic64((SInt64)synced, &gCntStaleSkip); }
+    if (!known && OSIncrementAtomic(&gNmxSyncLogs) < 16)
+        ALOG("swap: new back buffer %p kva %p %ux%u pitch %u (front %p) - shown, and from now on kept equal to the panel (b113)",
+             a2, b.kva, b.w, b.h, b.pitch, a1);
+    return copied ? 1 : 0;
+}
+static IOReturn nmxCopyForwardSync(unsigned int mode, IOAccelResource2 *a, IOAccelResource2 *b, const void *bounds, unsigned int n)
+{
+    /* the destination is the argument that is not the front buffer (swap a1); the source is always the last shown frame */
+    IOAccelResource2 *fa1 = gNmxSwapA1;
+    IOAccelResource2 *dstRes = (a == fa1) ? b : (b == fa1) ? a : (a == gNmxFront) ? b : (b == gNmxFront) ? a : nullptr;
+    NmxBuf d;
+    if (!dstRes || !nmxBufOf(dstRes, &d) || !nmxSyncLockReady()) {
+        OSAddAtomic64(1, &gCntCfFail);
+        if (OSIncrementAtomic(&gNmxCfLogs) < 24)
+            ALOG("copyfwd: mode 0x%x a %p b %p (front %p, shown %p) - no destination known: unsupported (b113)", mode, a, b, fa1, gNmxFront);
+        return kIOReturnUnsupported;
+    }
+    IOLockLock(gNmxSyncLock);
+    const NmxBuf s = gNmxLast;
+    if (!s.kva || s.w != d.w || s.h != d.h) {
+        IOLockUnlock(gNmxSyncLock);
+        OSAddAtomic64(1, &gCntCfFail);
+        if (OSIncrementAtomic(&gNmxCfLogs) < 24)
+            ALOG("copyfwd: mode 0x%x into %p - no shown frame of the same size yet: unsupported, WindowServer redraws (b113)", mode, dstRes);
+        return kIOReturnUnsupported;
+    }
+    unsigned long long px = 0;
+    if (s.kva != d.kva) {
+        const unsigned W = d.w, H = d.h;
+        const NmxBounds whole = { 0, 0, (int16_t)(W > 32767 ? 32767 : W), (int16_t)(H > 32767 ? 32767 : H) };
+        const NmxBounds *bb = (bounds && n) ? (const NmxBounds *)bounds : &whole;
+        const unsigned cnt = (bounds && n) ? (n > 4096 ? 4096 : n) : 1;
+        for (unsigned i = 0; i < cnt; i++) {
+            int x0 = bb[i].x, y0 = bb[i].y, x1 = x0 + bb[i].w, y1 = y0 + bb[i].h;
+            if (x0 < 0) x0 = 0;
+            if (y0 < 0) y0 = 0;
+            if (x1 > (int)W) x1 = (int)W;
+            if (y1 > (int)H) y1 = (int)H;
+            if (x1 <= x0 || y1 <= y0) continue;
+            const size_t rb = (size_t)(x1 - x0) * 4;
+            for (int y = y0; y < y1; y++)
+                memcpy(d.kva + (size_t)y * d.pitch + (size_t)x0 * 4, s.kva + (size_t)y * s.pitch + (size_t)x0 * 4, rb);
+            px += (unsigned long long)(x1 - x0) * (unsigned long long)(y1 - y0);
+        }
+    }
+    IOLockUnlock(gNmxSyncLock);
+    OSAddAtomic64(1, &gCntCfOk); OSAddAtomic64((SInt64)px, &gCntCfPx);
+    if (OSIncrementAtomic(&gNmxCfLogs) < 12)
+        ALOG("copyfwd: mode 0x%x %u rect(s) from the shown frame into %p, %llu px (b113)", mode, (bounds && n) ? n : 1u, dstRes, px);
+    return kIOReturnSuccess;
+}
+#endif

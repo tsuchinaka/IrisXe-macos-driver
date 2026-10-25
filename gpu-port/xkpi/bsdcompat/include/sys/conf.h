@@ -86,6 +86,7 @@ struct cdev {
     int nmx_base_minor;             /* minor of the clone node; opens get their own minors */
     u_int nmx_refs;                 /* creation reference + one per open (dev_ref/dev_rel) */
     int nmx_gone;                   /* destroy_dev ran: no new opens */
+    void *nmx_vn;                   /* the node's vnode (Linux inode), made at the first open */
     TAILQ_ENTRY(cdev) nmx_link;
     LIST_ENTRY(cdev) si_list;       /* in si_devsw->d_devs */
 };

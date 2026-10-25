@@ -51,33 +51,25 @@ index 07dec49..73e4861 100644
  struct drm_pciinfo {
  	uint16_t	domain;
  	uint8_t		bus;
-@@ -105,6 +106,31 @@ struct drm_pciinfo {
+@@ -105,6 +106,23 @@ struct drm_pciinfo {
  static drmServerInfoPtr drm_server_info;
  
  static bool drmNodeIsDRM(int maj, int min);
 +#ifdef __APPLE__
-+/* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev, so a DRM
-+ * node is recognised by finding its device number among the entries of /dev/dri. */
++/* Darwin assigns character majors at run time, and the NullMoth nodes are clone nodes: every lookup of
++ * /dev/dri/renderD128 is given a fresh minor (that is how each open gets state of its own), so a stat() minor never
++ * matches a second stat(). libdrm on Darwin therefore uses the DRM minor from the node's name (card0 = 0,
++ * renderD128 = 128; process_device), and a node is recognised by that name existing with the DRM major. */
 +static bool drm_darwin_node_exists(int maj, int min)
 +{
-+    DIR *dir = opendir(DRM_DIR_NAME);
-+    struct dirent *ent;
-+    bool found = false;
++    char path[PATH_MAX];
++    struct stat sbuf;
++    int type = min >> 6;
 +
-+    if (!dir)
++    if (min < 0 || (type != 0 && type != 2))
 +        return false;
-+    while (!found && (ent = readdir(dir)) != NULL) {
-+        char path[PATH_MAX];
-+        struct stat sbuf;
-+
-+        if (ent->d_name[0] == '.')
-+            continue;
-+        snprintf(path, sizeof(path), "%s/%s", DRM_DIR_NAME, ent->d_name);
-+        found = stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) &&
-+                (int)major(sbuf.st_rdev) == maj && (int)minor(sbuf.st_rdev) == min;
-+    }
-+    closedir(dir);
-+    return found;
++    snprintf(path, sizeof(path), "%s/%s%d", DRM_DIR_NAME, type == 0 ? "card" : "renderD", min);
++    return stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) && (int)major(sbuf.st_rdev) == maj;
 +}
 +#endif
  static char *drmGetMinorNameForFD(int fd, int type);

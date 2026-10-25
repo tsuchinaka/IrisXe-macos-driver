@@ -171,6 +171,22 @@ static NSString *nvmtl_aircache_dir(void) {
     return dir;
 }
 static _Atomic unsigned long gSpvHit, gSpvMiss, gSpvStored;
+/* b105 (Phase 4): an app sandbox cannot WRITE the shared cache, so nvmtl_aircache_dir() above is the app's own container
+   cache, which starts empty: TextEdit (10-20) re-translated all 161 shaders of QuartzCore's default.metallib that
+   WindowServer had already translated into /Library/GPUBundles/nvmtl. Reading the shared cache is allowed, so a miss in
+   the private cache looks there too (read-only; the private cache still receives what this process translates).
+   Returns nil when this process already uses the shared cache. */
+static NSString *nvmtl_shared_twin(NSString *privatePath) {
+    if (getenv("NVMTL_AIRCACHE") || getenv("NVMTL_NO_SHARED_CACHE")) return nil;
+    NSString *mine = [nvmtl_aircache_dir() stringByDeletingLastPathComponent];
+    NSString *shared = [@NVMTL_AIRCACHE_DIR stringByDeletingLastPathComponent];
+    if ([mine isEqualToString:shared] || ![privatePath hasPrefix:mine]) return nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ nvlog("library: private shader cache %s - the shared one in %s is read too (read-only here)",
+                                  mine.UTF8String, shared.UTF8String); });
+    return [shared stringByAppendingString:[privatePath substringFromIndex:mine.length]];
+}
+static _Atomic unsigned long gSharedHit;
 static _Atomic unsigned long gFcHit, gFcMiss, gFcStored;
 
 static _Atomic unsigned long long gSpvAdded;
@@ -482,6 +498,11 @@ static NSString *nvmtl_air_to_text(NSData *air) {
     NSString *cache = nvmtl_aircache_path(air);
     NSString *hit = [NSString stringWithContentsOfFile:cache encoding:NSUTF8StringEncoding error:nil];
     if (hit.length) { gAirHit++; return hit; }
+    NSString *twin = nvmtl_shared_twin(cache);   /* plain C declaration: this file is Objective-C, not C++ */
+    if (twin) {
+        hit = [NSString stringWithContentsOfFile:twin encoding:NSUTF8StringEncoding error:nil];
+        if (hit.length) { gAirHit++; gSharedHit++; return hit; }
+    }
     gAirMiss++;
     NSString *memoryIR = nvmtl_air_in_memory(air);
     if (memoryIR.length) {
@@ -703,8 +724,14 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
         NSString *spvp = nvmtl_spvcache_path(air, stage);
         NSData *spvData = getenv("NVMTL_SPVCACHE_OFF") ? nil : [NSData dataWithContentsOfFile:spvp];
         int hit = spvData.length >= 20 && *(const uint32_t *)spvData.bytes == 0x07230203u;
+        if (hit) utimes(spvp.fileSystemRepresentation, NULL);
+        else if (!getenv("NVMTL_SPVCACHE_OFF")) {   /* b105: the shared cache, read-only (see nvmtl_shared_twin) */
+            NSString *tw = nvmtl_shared_twin(spvp);
+            NSData *d = tw ? [NSData dataWithContentsOfFile:tw] : nil;
+            if (d.length >= 20 && *(const uint32_t *)d.bytes == 0x07230203u) { spvData = d; hit = 1; gSharedHit++; }
+        }
         uint8_t *spv = NULL; size_t spvn = 0; char err[512] = { 0 };
-        if (hit) { gSpvHit++; utimes(spvp.fileSystemRepresentation, NULL); }
+        if (hit) { gSpvHit++; }
         else {
             gSpvMiss++;
             if (xlate(ll.UTF8String, stage.UTF8String, &spv, &spvn, err, sizeof err) != 0) {
@@ -784,9 +811,9 @@ NSDictionary<NSString *, NSData *> *nvmtl_index_metallib_uncached(NSData *lib, N
         i += off + size - 1;
     }
     nvlog("library: metallib %lu bytes, %lu bitcode blobs, %lu entries indexed, %lu visible"
-          " | aircache %lu hit, %lu miss, %lu stored | spvcache %lu hit, %lu miss, %lu stored (%s)",
+          " | aircache %lu hit, %lu miss, %lu stored | spvcache %lu hit, %lu miss, %lu stored | %lu from the shared cache (%s)",
           (unsigned long)n, (unsigned long)found, (unsigned long)out.count, (unsigned long)visible,
-          gAirHit, gAirMiss, gAirStored, gSpvHit, gSpvMiss, gSpvStored, nvmtl_aircache_dir().UTF8String);
+          gAirHit, gAirMiss, gAirStored, gSpvHit, gSpvMiss, gSpvStored, (unsigned long)gSharedHit, nvmtl_aircache_dir().UTF8String);
     if (stageOut) *stageOut = [stages copy];
     if (airOut) *airOut = [airs copy];
     return (out.count || visible) ? [out copy] : nil;

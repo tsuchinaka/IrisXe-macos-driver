@@ -12,6 +12,9 @@ void nvlog(const char *fmt, ...);
 
 #import "NVMTLObjects.h"
 #import <objc/runtime.h>
+#include <unistd.h>
+#include <syslog.h>
+#include <stdarg.h>
 #import <objc/message.h>
 static int nvmtl_trace_on(void);
 static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -740,6 +743,12 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
           st ? "read/write" : "read", (unsigned long)offset, (__bridge void *)t);
     return t;
 }
+/* b121: runs a no-copy stand-in's deallocator when the copied buffer that replaced it is released */
+@interface NVMTLDeallocHolder : NSObject { @public void (^_block)(void *, NSUInteger); void *_ptr; NSUInteger _len; } @end
+@implementation NVMTLDeallocHolder
+- (void)dealloc { void (^b)(void *, NSUInteger) = _block; _block = nil; if (b) b(_ptr, _len); }
+@end
+static char kNVMTLStandinHolder;
 @implementation NVMTLBuffer
 - (IOSurfaceRef)iosurface { return NULL; }
 - (id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr {
@@ -753,13 +762,28 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     MTLTextureDescriptor *cd = [d copy]; cd.storageMode = MTLStorageModeShared;
     id<MTLTexture> c = [[self device] newTextureWithDescriptor:cd];
     if (c) [c replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(char *)base + offset bytesPerRow:bpr];
-    { static int said; if (!said++) nvlog("newTiledTextureWithDescriptor: linear view refused -> copied texture (%lux%lu bpr %lu; said once)",
-                                          (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr); }
+    /* b114: a mipmapped tiled texture (WindowServer 10-21: 54x54, 6 levels, on the lock screen) got only level 0 - an
+       image drawn smaller than its size samples the empty levels and shows black. Build the other levels from level 0. */
+    const BOOL mips = c && d.mipmapLevelCount > 1;
+    if (mips) {
+        static id<MTLCommandQueue> q; static dispatch_once_t once;
+        dispatch_once(&once, ^{ q = [[self device] newCommandQueue]; });
+        id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
+        id<MTLBlitCommandEncoder> be = cb ? [cb blitCommandEncoder] : nil;
+        if (be) { [be generateMipmapsForTexture:c]; [be endEncoding]; [cb commit]; [cb waitUntilCompleted]; }
+        else nvlog("newTiledTextureWithDescriptor: no blit encoder - %lu mip levels stay empty", (unsigned long)d.mipmapLevelCount);
+    }
+    { static int said; if (said++ < 4) nvlog("newTiledTextureWithDescriptor: linear view refused -> copied texture (%lux%lu bpr %lu, %lu mip level(s)%s)",
+                                          (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)d.mipmapLevelCount,
+                                          mips ? ", levels 1+ generated from level 0 (b114)" : ""); }
     return c;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr {
     extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
     if (!d) return nil;
+    nvtrace("NEWBUFTEX %lux%lu fmt %lu on buffer %p len %lu storage %lu imported %d copyhost %d off %lu row %lu", (unsigned long)d.width, (unsigned long)d.height,
+            (unsigned long)d.pixelFormat, (__bridge void *)self, (unsigned long)self.length, (unsigned long)_storage, (int)_b.imported, _hostPtr != NULL,
+            (unsigned long)offset, (unsigned long)bpr);
     if (d.textureType == MTLTextureTypeTextureBuffer) return nvmtl_texbuf_make(self, d, offset);
     size_t w = d.width, h = d.height;
     if (d.textureType != MTLTextureType2D || d.mipmapLevelCount > 1 || d.sampleCount > 1 || d.arrayLength > 1 || d.depth > 1
@@ -798,6 +822,31 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
 - (void)setResponsibleProcess:(int)pid { static int said; if (!said++) nvlog("setResponsibleProcess: pid %d on a buffer - per-process attribution is not kept; nothing to set (said once)", pid); }
 - (instancetype)initStandinWithDevice:(id)device bytesNoCopy:(void *)bytes length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))deallocator {
     id d = device ? device : (id)gNVMTLMainDevice;
+    /* b121: WindowServer uploads small images (icons, glyph runs, menu-bar pieces) through Metal's
+       newTiledTextureWithBytesNoCopy -> this stand-in: ~260 times in 20 s (nmx-bos 10-21), each one a host-pointer
+       import = a new GPU buffer object over the caller's pages (kernel userptr: pin + map) that is freed again moments
+       later. Up to 512 KB the bytes are copied into pooled GPU memory instead (no new buffer object); the caller's
+       deallocator still runs when this buffer goes away. Off: touch /Library/GPUBundles/nvmtl-nostandincopy. */
+    static int copyOn = -1;
+    if (copyOn < 0) { const char *e = getenv("NVMTL_STANDIN_COPY");
+                      /* b176: OFF by default. The copy was made once at creation and never re-read, but Core Animation
+                         keeps updating these glyph / image backing stores in place: the GPU kept the OLDER text - the
+                         invisible typed letters (Safari address bar, lock-screen password; 10-19..10-24). With the
+                         caller's pages imported the GPU always reads the current bytes (user 10-25: fixed with
+                         nvmtl-nostandincopy). The old copy mode: touch /Library/GPUBundles/nvmtl-standincopy */
+                      copyOn = e ? (e[0] == '1') : (access("/Library/GPUBundles/nvmtl-standincopy", F_OK) == 0);
+                      nvlog("initStandin: small client-storage stand-ins are %s (b121)", copyOn ? "COPIED into pooled memory" : "imported (host pointer)"); }
+    if (copyOn && bytes && length && length <= (512u << 10)) {
+        id cbuf = [d newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+        if (cbuf) {
+            if (deallocator) {
+                NVMTLDeallocHolder *hold = [NVMTLDeallocHolder new];
+                hold->_block = deallocator; hold->_ptr = bytes; hold->_len = length;
+                objc_setAssociatedObject(cbuf, &kNVMTLStandinHolder, hold, OBJC_ASSOCIATION_RETAIN);
+            }
+            return cbuf;
+        }
+    }
     id buf = [d newBufferWithBytesNoCopy:bytes length:length options:MTLResourceStorageModeShared deallocator:deallocator];
     { static int said; if (!said++) nvlog("initStandin: %lu-byte client-storage stand-in -> %s (said once)", (unsigned long)length,
                                           buf ? "a no-copy buffer over the caller's pages" : "nil (newBufferWithBytesNoCopy refused, reason above)"); }
@@ -861,12 +910,14 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b);
 @end
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
 static void nvmtl_surf_dirty(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
     if (!r->_surf) return;
+    cb->_wroteSurface = YES;
     if (!cb->_surfDirty) cb->_surfDirty = [NSMutableSet new];
     [cb->_surfDirty addObject:r];
 }
@@ -937,9 +988,16 @@ static int nvmtl_trace_on(void) {
     static uint64_t next; static int on;
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     static int cap = 2500;
-    if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-trace-request", F_OK) == 0;
+    if (now >= next) { next = now + 250000000ull; int was = on;
+        /* 10-18: also ~/nvmtl-trace-request (a sandbox or a private /tmp can hide the /tmp one) */
+        static char home_req[600]; if (!home_req[0]) { const char *h = getenv("HOME"); snprintf(home_req, sizeof home_req, "%s/nvmtl-trace-request", h ? h : "/tmp"); }
+        on = access("/tmp/nvmtl-trace-request", F_OK) == 0 || access(home_req, F_OK) == 0;
+        /* b161: WindowServer alone, with /Library/GPUBundles/nvmtl-wstrace (its file goes next to nvmtl-ws.log) */
+        if (!on && getprogname() && !strcmp(getprogname(), "WindowServer")) on = access("/Library/GPUBundles/nvmtl-wstrace", F_OK) == 0;
+        if (on && !was) nvlog("G15 trace: ON (request file seen) - writing %s/nvmtl-trace-%d.txt", getenv("HOME") ?: "/tmp", (int)getpid());
         g_trace_bigonly = on && access("/tmp/nvmtl-trace-big", F_OK) == 0; if (!g_trace_bigonly) g_trace_mute = 0;
-        if (on && !was) { g_trace_lines = 0; cap = access("/tmp/nvmtl-trace-long", F_OK) == 0 ? 20000 : 2500; } }
+        if (on && !was) { g_trace_lines = 0; cap = access("/tmp/nvmtl-trace-long", F_OK) == 0 ? 20000 : 2500;
+            if (getprogname() && !strcmp(getprogname(), "WindowServer")) cap = 400000; } }
     return on && !g_trace_mute && g_trace_lines < cap;
 }
 static int nvtrace_scope(uint32_t w, uint32_t h) { int was = g_trace_mute; g_trace_mute = 0; (void)nvmtl_trace_on();
@@ -947,13 +1005,148 @@ static int nvtrace_scope(uint32_t w, uint32_t h) { int was = g_trace_mute; g_tra
 static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void nvtrace(const char *fmt, ...) {
     if (!nvmtl_trace_on()) return;
-    char p[96]; snprintf(p, sizeof p, "/tmp/nvmtl-trace-%d.txt", (int)getpid());
+    static int ws = -1; if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+    if (ws) {   /* b162: WindowServer keeps only the lines that show where content comes from, each with a time in ms */
+        static const char *const keep[] = { "PASS", "FTEX", "REPLACE", "BLIT", "COMMIT", "EVENT", "DUMP", "MIPS", "NEWBUFTEX", "NEWSURFTEX",
+                                            "NEWNOCOPY", "SURFIN", NULL };
+        int k = 0; for (; keep[k]; k++) if (!strncmp(fmt, keep[k], strlen(keep[k]))) break;
+        if (!keep[k]) return;
+    }
+    char p[600]; snprintf(p, sizeof p, "%s/nvmtl-trace-%d.txt", getenv("HOME") ?: "/tmp", (int)getpid());
+    if (getprogname() && !strcmp(getprogname(), "WindowServer")) {   /* b161: next to nvmtl-ws.log, which WindowServer can write */
+        extern const char *nvmtl_log_path(void); const char *lp = nvmtl_log_path(); const char *sl = strrchr(lp, '/');
+        int n = sl ? (int)(sl - lp) : 0; snprintf(p, sizeof p, "%.*s/nvmtl-trace-%d.txt", n, lp, (int)getpid()); }
     int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0) { static int said; if (!said++) nvlog("G15 trace: cannot open %s (errno %d)", p, errno); return; }
-    char b[700]; va_list a; va_start(a, fmt); int n = vsnprintf(b, sizeof b - 1, fmt, a); va_end(a);
+    char b[700]; int pre = ws ? snprintf(b, 32, "t%llu ", (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull)) : 0;
+    if (pre < 0 || pre > 31) pre = 0;
+    va_list a; va_start(a, fmt); int n = pre + vsnprintf(b + pre, sizeof b - 1 - pre, fmt, a); va_end(a);
     if (n < 0) n = 0; if (n > (int)sizeof b - 2) n = (int)sizeof b - 2;
     b[n++] = '\n'; if (write(fd, b, (size_t)n) != n) { static int said2; if (!said2++) nvlog("G15 trace: short write (errno %d)", errno); }
     close(fd); g_trace_lines++;
+}
+void nvmtl_trace_nocopy(void *p, unsigned long n, int sm) { nvtrace("NEWNOCOPY %p len %lu storage %d", p, n, sm); }
+/* b160: flag files read at most every 250 ms (WindowServer cannot be given environment variables) */
+static uint64_t g_hostflush_chk, g_surfalways_chk; static int g_hostflush_on, g_surfalways_on;
+static int nvmtl_flag_file(const char *path, uint64_t *chk, int *on) {
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= *chk) { *chk = now + 250000000ull; int was = *on; *on = access(path, F_OK) == 0;
+        if (*on != was) nvlog("b160 test %s: %s", path, *on ? "ON" : "off"); }
+    return *on;
+}
+static void nvmtl_host_flush(IOSurfaceRef sf) {
+    const size_t n = IOSurfaceGetAllocSize(sf);
+    if (!n || n > (16u << 20)) return;
+    if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) != 0) return;
+    const uint8_t *b = (const uint8_t *)IOSurfaceGetBaseAddress(sf);
+    if (b) { for (size_t o = 0; o < n; o += 64) __builtin_ia32_clflush(b + o); __builtin_ia32_mfence(); }
+    IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+    static unsigned said; if (said++ < 4) nvlog("b160 hostflush: %zu bytes of surface %u written back before the GPU read", n, (unsigned)IOSurfaceGetID(sf));
+}
+/* b153: surface dumps for Brave's Graphite (white bars, stale text). While ~/nvmtl-dump-request exists, every IOSurface
+   a finished command buffer wrote (raster tiles, window pictures; 4-byte pixels, >= 256 wide) is saved as a PPM picture in
+   ~/nvmtl-dump/ - at most 80 files per process, each surface at most every 4th write. A DUMP line in the G15 trace names
+   each file, so a picture can be matched with the passes that drew it. */
+static int nvmtl_dump_on(void) {
+    static uint64_t next; static int on;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= next) { next = now + 250000000ull;
+        char req[600]; const char *h = getenv("HOME"); snprintf(req, sizeof req, "%s/nvmtl-dump-request", h ? h : "/tmp");
+        int was = on; on = access(req, F_OK) == 0;
+        if (on && !was) nvlog("b153 dump: ON (%s seen) - pictures go to %s/nvmtl-dump/", req, h ? h : "/tmp"); }
+    return on;
+}
+static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* b157: WindowServer change dumps for the invisible typed letters. While /Library/GPUBundles/nvmtl-wsdump exists,
+   every finished WindowServer frame on a big IOSurface (>= 1000 px wide) is compared with that surface's previous
+   frame, and only the CHANGED rectangle is saved (PPM, with its position and the time in ms in the file name) to
+   nvmtl-wsdump/ next to nvmtl-ws.log. Shows whether the newest letter is in WindowServer's own picture at once
+   (then the display path shows it late) or appears there only with the next update (then WindowServer drew it late).
+   At most 400 files; the file is read every 250 ms. */
+static int nvmtl_wsdump_on(void) {
+    static uint64_t next; static int on, ws = -1;
+    if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+    if (!ws) return 0;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= next) { next = now + 250000000ull; int was = on; on = access("/Library/GPUBundles/nvmtl-wsdump", F_OK) == 0;
+        if (on && !was) nvlog("b157 wsdump: ON - changed rectangles of WindowServer frames are saved"); }
+    return on;
+}
+static void nvmtl_wsdump_surface(IOSurfaceRef surf) {
+    static int files; static NSMutableDictionary *prev; static char dir[700];
+    if (!surf || files >= 400) return;
+    const size_t w = IOSurfaceGetWidth(surf), h = IOSurfaceGetHeight(surf), bpr = IOSurfaceGetBytesPerRow(surf);
+    if (IOSurfaceGetBytesPerElement(surf) != 4 || w < 1000 || !h || w > 8192 || h > 8192) return;
+    if (!dir[0]) { extern const char *nvmtl_log_path(void); const char *lp = nvmtl_log_path(); const char *sl = strrchr(lp, '/');
+        size_t n = sl ? (size_t)(sl - lp) : 0; if (n >= sizeof dir - 20) n = 0;
+        memcpy(dir, lp, n); dir[n] = 0; strlcat(dir, n ? "/nvmtl-wsdump" : "/tmp/nvmtl-wsdump", sizeof dir); mkdir(dir, 0755); }
+    if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != 0) return;
+    const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surf);
+    if (!base) { IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL); return; }
+    if (!prev) prev = [NSMutableDictionary new];
+    const unsigned sid = (unsigned)IOSurfaceGetID(surf);
+    NSMutableData *old = prev[@(sid)];
+    if (!old || old.length != w * h * 4) {
+        old = [NSMutableData dataWithLength:w * h * 4]; prev[@(sid)] = old;
+        for (size_t y = 0; y < h; y++) memcpy((uint8_t *)old.mutableBytes + y * w * 4, base + y * bpr, w * 4);
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL); return;   /* first frame: reference only */
+    }
+    uint8_t *o = (uint8_t *)old.mutableBytes; size_t x0 = w, y0 = h, x1 = 0, y1 = 0;
+    for (size_t y = 0; y < h; y++) {
+        const uint32_t *a = (const uint32_t *)(base + y * bpr), *b = (const uint32_t *)(o + y * w * 4);
+        if (!memcmp(a, b, w * 4)) continue;
+        if (y < y0) y0 = y; y1 = y;
+        size_t l = 0; while (l < w && a[l] == b[l]) l++;
+        size_t r = w; while (r > l && a[r-1] == b[r-1]) r--;
+        if (l < x0) x0 = l; if (r > x1) x1 = r;
+    }
+    if (x1 > x0 && y1 >= y0) {
+        size_t cw = x1 - x0, ch = y1 - y0 + 1;
+        uint64_t ms = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull;
+        char path[900]; snprintf(path, sizeof path, "%s/%03d-t%llu-surf%u-x%zu-y%zu-%zux%zu.ppm", dir, files, (unsigned long long)ms, sid, x0, y0, cw, ch);
+        FILE *f = (cw * ch <= 4000000) ? fopen(path, "wb") : NULL;
+        if (f) {
+            fprintf(f, "P6\n%zu %zu\n255\n", cw, ch);
+            uint8_t *row = (uint8_t *)malloc(cw * 3);
+            for (size_t y = y0; row && y <= y1; y++) {
+                const uint8_t *src = base + y * bpr + x0 * 4;
+                for (size_t x = 0; x < cw; x++) { row[3*x] = src[4*x+2]; row[3*x+1] = src[4*x+1]; row[3*x+2] = src[4*x]; }
+                fwrite(row, 1, cw * 3, f);
+            }
+            free(row); fclose(f); files++;
+        }
+        for (size_t y = y0; y <= y1; y++) memcpy(o + y * w * 4, base + y * bpr, w * 4);
+    }
+    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+}
+static void nvmtl_dump_surface(IOSurfaceRef surf) {
+    if (nvmtl_wsdump_on()) { nvmtl_wsdump_surface(surf); return; }
+    static int files; static NSMutableDictionary *seen;
+    if (!surf || files >= 80 || !nvmtl_dump_on()) return;
+    const size_t w = IOSurfaceGetWidth(surf), h = IOSurfaceGetHeight(surf), bpr = IOSurfaceGetBytesPerRow(surf);
+    if (IOSurfaceGetBytesPerElement(surf) != 4 || w < 256 || !h || h > 4096 || w > 4096) return;
+    const unsigned sid = (unsigned)IOSurfaceGetID(surf);
+    if (!seen) seen = [NSMutableDictionary new];
+    unsigned long n = [seen[@(sid)] unsignedLongValue]; seen[@(sid)] = @(n + 1);
+    if (n % 4) return;
+    const char *home = getenv("HOME"); char dir[600], path[700];
+    snprintf(dir, sizeof dir, "%s/nvmtl-dump", home ? home : "/tmp"); mkdir(dir, 0755);
+    snprintf(path, sizeof path, "%s/%d-%02d-surf%u-%zux%zu-w%lu.ppm", dir, (int)getpid(), files, sid, w, h, n);
+    if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != 0) return;
+    const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surf);
+    FILE *f = base ? fopen(path, "wb") : NULL;
+    if (f) {
+        fprintf(f, "P6\n%zu %zu\n255\n", w, h);
+        uint8_t *row = (uint8_t *)malloc(w * 3);
+        for (size_t y = 0; row && y < h; y++) {
+            const uint8_t *src = base + y * bpr;
+            for (size_t x = 0; x < w; x++) { row[3*x] = src[4*x+2]; row[3*x+1] = src[4*x+1]; row[3*x+2] = src[4*x]; }
+            fwrite(row, 1, w * 3, f);
+        }
+        free(row); fclose(f); files++;
+        nvtrace("DUMP %s", path);
+    }
+    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
 }
 static void nvtrace_floats(const char *what, unsigned long idx, unsigned long off, const void *map, int nf) {
     if (!nvmtl_trace_on()) return;
@@ -991,7 +1184,49 @@ static void nvmtl_surface_overwrite_recorded(NVMTLCommandBuffer *cb, NVMTLTextur
     if (!cb->_surfOverwrites) cb->_surfOverwrites = [NSMutableSet new];
     [cb->_surfOverwrites addObject:r];
 }
+/* b158: with /Library/GPUBundles/nvmtl-wsdump, WindowServer also saves every app IOSurface it SAMPLES (up to 1400 x 240,
+   e.g. a text field) whenever that surface's seed moved since its last save - the CPU's view of the pages at the moment
+   WindowServer records the draw. Name: in-<n>-t<ms>-surf<id>-seed<seed>-<host|copy>-<w>x<h>.ppm. Compared with the
+   output crops it shows whether the app's surface already held the new letter when WindowServer drew the frame. */
+static void nvmtl_wsdump_input(NVMTLTexture *r) {
+    static int files; static NSMutableDictionary *last;
+    if (!r || !r->_surf || files >= 800 || !nvmtl_wsdump_on()) return;
+    IOSurfaceRef sf = r->_surf;
+    const size_t w = IOSurfaceGetWidth(sf), h = IOSurfaceGetHeight(sf), bpr = IOSurfaceGetBytesPerRow(sf);
+    /* b159: up to 4096 x 400 (b158's 1400 px limit left out Safari's toolbar, which is as wide as the window), and saved
+       when the CONTENT changed, not only the seed: a zero-copy reader sees new pixels even when the seed stays. */
+    if (IOSurfaceGetBytesPerElement(sf) != 4 || IOSurfaceGetPlaneCount(sf) > 1 || w < 40 || h < 10 || w > 4096 || h > 400) return;
+    const unsigned sid = (unsigned)IOSurfaceGetID(sf); const uint32_t seed = IOSurfaceGetSeed(sf);
+    if (!last) last = [NSMutableDictionary new];
+    if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) != 0) return;
+    uint64_t hsh = 1469598103934665603ull;
+    { const uint8_t *b0 = (const uint8_t *)IOSurfaceGetBaseAddress(sf);
+      for (size_t y = 0; b0 && y < h; y++) { const uint64_t *q = (const uint64_t *)(b0 + y * bpr);
+          for (size_t x = 0; x < (w * 4) / 8; x++) { hsh ^= q[x]; hsh *= 1099511628211ull; } } }
+    IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+    NSNumber *ls = last[@(sid)]; if (ls && ls.unsignedLongLongValue == hsh) return;
+    last[@(sid)] = @(hsh);
+    extern const char *nvmtl_log_path(void); char dir[700]; const char *lp = nvmtl_log_path(); const char *sl = strrchr(lp, '/');
+    size_t n = sl ? (size_t)(sl - lp) : 0; if (n >= sizeof dir - 20) n = 0; memcpy(dir, lp, n); dir[n] = 0;
+    strlcat(dir, n ? "/nvmtl-wsdump" : "/tmp/nvmtl-wsdump", sizeof dir); mkdir(dir, 0755);
+    if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) != 0) return;
+    const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(sf);
+    uint64_t ms = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull;
+    char path[900]; snprintf(path, sizeof path, "%s/in-%03d-t%llu-surf%u-seed%u-%s-%zux%zu-h%08llx.ppm", dir, files, (unsigned long long)ms, sid, seed,
+                             r->_hostOn ? "host" : "copy", w, h, (unsigned long long)(hsh & 0xffffffffull));
+    FILE *f = base ? fopen(path, "wb") : NULL;
+    if (f) {
+        fprintf(f, "P6\n%zu %zu\n255\n", w, h);
+        uint8_t *row = (uint8_t *)malloc(w * 3);
+        for (size_t y = 0; row && y < h; y++) { const uint8_t *src = base + y * bpr;
+            for (size_t x = 0; x < w; x++) { row[3*x] = src[4*x+2]; row[3*x+1] = src[4*x+1]; row[3*x+2] = src[4*x]; }
+            fwrite(row, 1, w * 3, f); }
+        free(row); fclose(f); files++;
+    }
+    IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+}
 static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+    if (t) { NVMTLTexture *r0 = t->_parent ? t->_parent : t; if (r0->_surf) nvmtl_wsdump_input(r0); }
     if (!t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
     if (cb && r->_surf && [cb->_surfOverwrites containsObject:r]) return;
@@ -1127,6 +1362,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (!_parent) nvmtl_vk_image_destroy(&_i);
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
+    if (!_parent && _hostOn) { nvmtl_vk_buffer_destroy(&_hostBuf); _hostOn = NO; }   /* before the surface is released */
     if (_surfOwned && _surf) CFRelease(_surf);
     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
@@ -1143,15 +1379,43 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
         (void *)_surf, (unsigned long)_plane, _i.w, _i.h, _i.bpp, IOSurfaceGetBytesPerElementOfPlane(_surf, (uint32_t)_plane));
     return NO;
 }
+/*
+ * b129: typed characters stayed invisible until the next key (10-22; the frame WindowServer handed to the panel really
+ * lacked them - no late GPU write, b129 kernel checksums). An app's write lock moves the IOSurface seed when the write
+ * STARTS. When WindowServer composites while the app is still drawing, surface-in uploads half-drawn pixels and records the
+ * new seed; the app's unlock does not move the seed again, so the finished glyph is never uploaded until the next change.
+ * Fix: after an upload caused by a seed change, the next use uploads once more even at the same seed.
+ * Off: touch /Library/GPUBundles/nvmtl-noverify (checked every 250 ms).
+ */
+static int nvmtl_noverify(void) { static uint64_t next; static int on; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= next) { next = now + 250000000ull; int was = on; on = access("/Library/GPUBundles/nvmtl-noverify", F_OK) == 0;
+        if (on != was) nvlog("b129 surface-in verify upload %s", on ? "OFF (nvmtl-noverify)" : "on"); }
+    return on; }
+static unsigned long long g_surfin_verify;
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
+    nvtrace("SURFIN surf %u %ux%u seed %u host %d synced %d lastseed %u", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h,
+            (unsigned)IOSurfaceGetSeed(r->_surf), (int)r->_hostOn, (int)r->_surfSynced, r->_surfSeed);
+    if (r->_hostOn) {   /* zero-copy: the GPU reads the surface's own pages */
+        /* b160 test (/Library/GPUBundles/nvmtl-hostflush): write the CPU caches' copy of the surface's pages back to
+           memory before the GPU reads them. If the invisible letters go away, the GPU reads app surfaces without
+           snooping the CPU caches (an uncached GPU mapping of the imported pages) and sees the app's text late. */
+        if (nvmtl_flag_file("/Library/GPUBundles/nvmtl-hostflush", &g_hostflush_chk, &g_hostflush_on)) nvmtl_host_flush(r->_surf);
+        return;
+    }
     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
-    if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
+    const BOOL verify = r->_surfVerify && !nvmtl_noverify();
+    const BOOL wasSynced = r->_surfSynced; const uint32_t oldSeed = r->_surfSeed;
+    /* b160 test (/Library/GPUBundles/nvmtl-surfin-always): copy mode uploads the surface at EVERY use, seed or not -
+       shows whether apps change surfaces without moving the seed */
+    const BOOL always = nvmtl_flag_file("/Library/GPUBundles/nvmtl-surfin-always", &g_surfalways_chk, &g_surfalways_on)
+                        && IOSurfaceGetAllocSize(r->_surf) <= (8u << 20);
+    if (!always && r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen) && !verify) return;
     if (![r nvmtlSurfaceCopyable]) return;
     { uint32_t now = IOSurfaceGetSeed(r->_surf);
       if (r->_vramOn && nvmtl_vram_tag_current(r->_surf, r->_plane, now)) {
-          r->_surfSeed = now; r->_surfSynced = YES; g_surfin_skip++;
+          r->_surfSeed = now; r->_surfSynced = YES; r->_surfVerify = NO; g_surfin_skip++;
           static unsigned ns; if (ns++ < 6 || ns % 2000 == 0) nvlog("item 7: surface-in SKIPPED (shared VRAM current at seed %u): %llu skipped, %llu copied", now, g_surfin_skip, g_surfin_copy);
           return; } }
     uint32_t seed = 0;
@@ -1162,6 +1426,9 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
+    r->_surfVerify = (!wasSynced || seed != oldSeed) ? YES : NO;   /* new content: check it once more next time */
+    if (verify && wasSynced && seed == oldSeed) { g_surfin_verify++;
+        static unsigned nv; if (nv++ < 4 || nv % 5000 == 0) nvlog("b129 surface-in verify upload #%llu (%ux%u, seed %u)", g_surfin_verify, r->_i.w, r->_i.h, seed); }
     r->_surfSeed = seed; r->_surfSynced = YES; r->_surfGen = vgen;
     g_surfin_copy++; if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-in #%u: %ux%u surface %p seed %u uploaded", n, r->_i.w, r->_i.h, (void *)r->_surf, seed);
@@ -1169,6 +1436,13 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
 - (BOOL)nvmtlSurfaceOut {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return YES;
+    if (r->_hostOn) {
+        /* zero-copy: the GPU already wrote the surface's own pages. A write lock/unlock moves the seed, as a GPU write
+           does on Apple's drivers, so readers that watch the seed (CoreAnimation) see new content. No copy. */
+        if (IOSurfaceLock(r->_surf, 0, NULL) == kIOReturnSuccess) IOSurfaceUnlock(r->_surf, 0, NULL);
+        static unsigned nh; if (nh++ < 4 || nh % 5000 == 0) nvlog("zero-copy surface-out #%u: %ux%u surface %u - no copy", nh, r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf));
+        return YES;
+    }
     if (![r nvmtlSurfaceCopyable]) return NO;
     if (r->_vramOn && !nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)) {
         uint32_t seed = IOSurfaceGetSeed(r->_surf);
@@ -3576,6 +3850,11 @@ void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared) {
     extern nvk_queue *nvmtl_device_queue(void);
     static int noPlace = -1, noRecycle = -1;
     if (noPlace < 0) { noPlace = getenv("NVMTL_NO_HEAPTEX_PLACE") != NULL; noRecycle = getenv("NVMTL_NO_HEAPTEX_RECYCLE") != NULL;
+        /* b74: Chromium-family helpers flicker (GPU raster, new-tab page) with heap texture placement on; the user's
+           bisect (10-19, tests C5/C6) pinned it here. Off by default there; NVMTL_HEAPTEX_PLACE=1 turns it back on. */
+        { const char *me = getprogname(), *on = getenv("NVMTL_HEAPTEX_PLACE");
+          if (!noPlace && !(on && on[0] == '1') && me && strstr(me, " Helper")) {
+              noPlace = 1; nvlog("heap texture: %s is a Chromium-family helper - placement OFF by default (b74 flicker fix)", me); } }
         nvlog("heap texture: dres R1 placement %s, recycle %s", noPlace ? "OFF (NVMTL_NO_HEAPTEX_PLACE)" : "ON",
               noRecycle ? "OFF (NVMTL_NO_HEAPTEX_RECYCLE)" : "ON"); }
     if (noPlace) return nil;
@@ -3782,6 +4061,8 @@ static int nvmtl_enc78_on(int row) {
     int off = __atomic_load_n(&g_e78_off, __ATOMIC_RELAXED);
     if (off < 0) {
         const char *e = getenv("NVMTL_ENC78_OFF"); off = 0;
+        /* b145: file switch for WindowServer (no environment): every encoder-barrier shortcut off */
+        if (!e && access("/Library/GPUBundles/nvmtl-e78off", F_OK) == 0) { e = "all"; nvlog("enc78: nvmtl-e78off file - all rows off"); }
         if (e) {
             if (strstr(e, "all")) off = 31;
             if (strstr(e, "h3")) off |= NVMTL_E78_H3;
@@ -3821,6 +4102,8 @@ static int nvmtl_g79_on(int row) {
     int off = __atomic_load_n(&g_g79_off, __ATOMIC_RELAXED);
     if (off < 0) {
         const char *e = getenv("NVMTL_G79_OFF"); off = 0;
+        /* b145: file switch for WindowServer (no environment): every barrier/encoder/event shortcut off */
+        if (!e && access("/Library/GPUBundles/nvmtl-g79off", F_OK) == 0) { e = "all"; nvlog("gsub: nvmtl-g79off file - all rows off"); }
         if (e) {
             if (strstr(e, "all")) off = 63;
             if (strstr(e, "bar")) off |= NVMTL_G79_BAR;
@@ -3994,7 +4277,77 @@ static int nvmtl_nvconv_try(NVMTLComputeCommandEncoder *e, MTLSize grid, MTLSize
     return 1;
 }
 
+/* b177 diagnostic (/Library/GPUBundles/nvmtl-cidump): Photo Booth's live preview is turned 180 degrees (10-25) while the
+   saved photo, QuickTime and browsers are right; VideoToolbox's conversion output is upright, so it happens in Core
+   Image's ci_affine* kernel. Logs (nvmtl log, first 12 dispatches) its uniform buffer 0 as floats - destination origin
+   and flip (row 0 .w < 0 = write y flipped), the sampling affine rows - plus the textures and pixel samplers bound. */
+/* own writer: nvlog keeps only 8 lines per call site; this goes to the unified log (log show ... CIDUMP) and the file */
+static void cilog(const char *fmt, ...) {
+    char b[600]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
+    syslog(LOG_NOTICE, "NVMTL %s", b);
+    extern const char *nvmtl_log_path(void);
+    FILE *fl = fopen(nvmtl_log_path(), "a"); if (fl) { fprintf(fl, "pid %d NVMTL: %s\n", getpid(), b); fclose(fl); }
+}
+static int nvmtl_cidump_on(void) {
+    static uint64_t chk; static int on;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now >= chk) { chk = now + 500000000ull; on = access("/Library/GPUBundles/nvmtl-cidump", F_OK) == 0; }
+    return on;
+}
+static int nvmtl_cidump_fn(NVMTLComputePipelineState *ps) {
+    const char *n = ps && ps->_function ? ps->_function->_fname.UTF8String : NULL;
+    return n && !strncmp(n, "ci_", 3) && nvmtl_cidump_on();
+}
+static void nvmtl_cidump_dispatch(NVMTLComputePipelineState *ps, NSDictionary *bufAt, NSDictionary *samplers, const uint32_t *t) {
+    static int n; if (!nvmtl_cidump_fn(ps) || n >= 12) return; n++;
+    cilog("CIDUMP %d %s threads %ux%u", n, ps->_function->_fname.UTF8String, t[0], t[1]);
+    NSArray *b0 = bufAt[@0]; NVMTLBuffer *b = b0 ? b0[0] : nil; NSUInteger off = b0 ? [b0[1] unsignedIntegerValue] : 0;
+    const float *f = b ? (const float *)((const uint8_t *)[b contents] + off) : NULL;
+    if (!f) cilog("CIDUMP   buffer 0: not a CPU-visible buffer (setBytes?)");
+    else { size_t len = b.length > off ? b.length - off : 0; if (len > 288) len = 288;
+        for (size_t r = 0; r * 16 < len; r++)
+            cilog("CIDUMP   b0[%2zu] @%3zu: %10.4f %10.4f %10.4f %10.4f", r, r * 16, f[r * 4], f[r * 4 + 1], f[r * 4 + 2], f[r * 4 + 3]); }
+    if (samplers.count) cilog("CIDUMP   pixel samplers: %s", samplers.description.UTF8String);
+}
+/* b178/b179 (/Library/GPUBundles/nvmtl-ciflip, one process name per line, e.g. "Photo Booth"): the 10-25 CIDUMP shows Core
+   Image asking for an UNflipped write (b0[0].w = +480) into Photo Booth's 720x480 surface while its sampling rows already
+   turn the picture upside down for a y-up surface (src y = 720 - 1.5 y) - on screen the preview is upside down. For the
+   listed apps a ci_* dispatch with b0[0].w >= 0 gets a copy of buffer 0 with w = 2*origin.y - height (the kernel's own
+   flipped-write encoding: row r -> height-1-r); the app's buffer is not touched. */
+static int nvmtl_ciflip_app(void) {
+    static uint64_t chk; static int on;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now < chk) return on;
+    chk = now + 1000000000ull; on = 0;
+    const char *me = getprogname(); char line[256];
+    /* b179: on by default for Photo Booth (user 10-25: preview, Effects and saved photo all right with it). The file,
+       when present, replaces the default list; an empty file turns it off everywhere. */
+    FILE *f = fopen("/Library/GPUBundles/nvmtl-ciflip", "r");
+    if (!f) { on = me && !strcmp(me, "Photo Booth"); return on; }
+    while (me && fgets(line, sizeof line, f)) { line[strcspn(line, "\r\n")] = 0; if (line[0] && !strcmp(line, me)) { on = 1; break; } }
+    fclose(f);
+    return on;
+}
+@interface NVMTLComputeCommandEncoder () { @public NVMTLTexture *_ciDst; } @end
 @implementation NVMTLComputeCommandEncoder
+/* b178: returns YES when it rebound buffer 0 (the caller restores the app's binding after the dispatch) */
+- (BOOL)nvmtlCIFlipBegin {
+    const char *n = _ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL;
+    if (!n || strncmp(n, "ci_", 3) || !_ciDst || !nvmtl_ciflip_app()) return NO;
+    if (!nvmtl_surf_id(_ciDst)) return NO;            /* only the final picture (an IOSurface), not CI's own intermediates */
+    NSArray *b0 = _bufAt[@0]; NVMTLBuffer *b = b0 ? b0[0] : nil; NSUInteger off = b0 ? [b0[1] unsignedIntegerValue] : 0;
+    const uint8_t *src = b ? (const uint8_t *)[b contents] : NULL;
+    if (!src || b.length < off + 16) return NO;
+    NSUInteger len = b.length - off; if (len > 4096) len = 4096;
+    float f[1024]; memcpy(f, src + off, len);
+    if (f[3] < 0.0f) return NO;                       /* Core Image already asked for the flip */
+    const float h = (float)[_ciDst nvi]->h;
+    { static int said; if (said++ < 4) nvlog("b178 ciflip (%s): %s b0[0] = (%.1f %.1f %.1f %.1f) -> w %.1f (target %ux%u)", getprogname(), n,
+                                             f[0], f[1], f[2], f[3], 2.0f * f[1] - h, [_ciDst nvi]->w, [_ciDst nvi]->h); }
+    f[3] = 2.0f * f[1] - h;
+    [self setBytes:f length:len atIndex:0];
+    return YES;
+}
 - (unsigned long long)globalTraceObjectID { return nvmtl_global_trace_id(self); }
 static void nvmtl_stride_dropped(NSUInteger st) { static BOOL said; if (!said && st) { said = YES;
     nvlog("compute: attributeStride %lu dropped (dynamic strides not implemented) - buffer bound", (unsigned long)st); } }
@@ -4187,6 +4540,10 @@ static void nvmtl_zprobe_drain(void) {
     NVMTLTexture *nt = (NVMTLTexture *)t;
     if (!nt) { nvlog("compute setTexture: nil at %lu", (unsigned long)i); return; }
     nvmtl_zprobe_record(nt, _ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL, (unsigned)i, nt->_stex ? 1u : 0u);
+    { static int said; if (said < 40 && nvmtl_cidump_fn(_ps)) { said++;
+        cilog("CIDUMP   %s texture %lu: %ux%u fmt %lu usage 0x%lx surf %u%s", _ps->_function->_fname.UTF8String, (unsigned long)i,
+              [nt nvi]->w, [nt nvi]->h, (unsigned long)nt->_fmt, (unsigned long)nt->_usage, nvmtl_surf_id(nt), nt->_parent ? " (view)" : ""); } }
+    if (i == 0) _ciDst = nt;
     nvmtl_retain_resource(_cb, nt);
     nvmtl_surface_in_for_cb(_cb, nt); if (nt->_stex) nvmtl_surf_dirty(_cb, nt);
     if (nt->_tbView) nvmtl_vk_bind_texel_view(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, nt->_tbView, nt->_tbStorage);
@@ -4228,8 +4585,11 @@ static void nvmtl_zprobe_drain(void) {
     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_);
         nvtrace("DISPATCH %s | threads %ux%ux%u tg %ux%ux%u", (_ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL) ?: "-", t[0], t[1], t[2], l[0], l[1], l[2]);
         nvtrace("  BUFS%s", bufs_); }
+    nvmtl_cidump_dispatch(_ps, _bufAt, _samplers, t);
+    NSArray *ciKeep = _bufAt[@0]; const BOOL ciFlip = [self nvmtlCIFlipBegin];
     [self nvmtlE78Barrier:NO];
     if (nvmtl_vendor_dispatch_sass(selected, &_cb->_c, t, l) != 0) nvmtl_vk_cmd_dispatch_threads(&_cb->_c, &selected->_p, t, l);
+    if (ciFlip && ciKeep) [self setBuffer:ciKeep[0] offset:[ciKeep[1] unsignedIntegerValue] atIndex:0];
     if (_cb->_stTwins.count) nvmtl_storage_twins_out(_cb);
 }
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tg {
@@ -4242,8 +4602,11 @@ static void nvmtl_zprobe_drain(void) {
     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_);
         nvtrace("DISPATCH %s | threads %ux%ux%u tg %ux%ux%u", (_ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL) ?: "-", t[0], t[1], t[2], l[0], l[1], l[2]);
         nvtrace("  BUFS%s", bufs_); }
+    nvmtl_cidump_dispatch(_ps, _bufAt, _samplers, t);
+    NSArray *ciKeep = _bufAt[@0]; const BOOL ciFlip = [self nvmtlCIFlipBegin];
     [self nvmtlE78Barrier:NO];
     if (nvmtl_vendor_dispatch_sass(selected, &_cb->_c, t, l) != 0) nvmtl_vk_cmd_dispatch_threads(&_cb->_c, &selected->_p, t, l);
+    if (ciFlip && ciKeep) [self setBuffer:ciKeep[0] offset:[ciKeep[1] unsignedIntegerValue] atIndex:0];
     if (_cb->_stTwins.count) nvmtl_storage_twins_out(_cb);
 }
 - (void)setBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i {
@@ -4619,10 +4982,17 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     if (e->_target) { NVMTLTexture *sr = e->_target->_parent ? e->_target->_parent : e->_target;
         nvmtl_census("render target", [sr nvi]->w, [sr nvi]->h, sr->_surf != NULL);
         (void)nvtrace_scope([sr nvi]->w, [sr nvi]->h);
-        nvtrace("PASS target %ux%u surf %u view %d load %lu store %lu clear (%.3g %.3g %.3g %.3g) depth %d", [sr nvi]->w, [sr nvi]->h,
-            sr->_surf ? (unsigned)IOSurfaceGetID(sr->_surf) : 0u, e->_target->_parent != nil, (unsigned long)d.colorAttachments[0].loadAction,
+        /* b153: + samples, the resolve target (size, surface), depth load/store - for Brave's Graphite (white bars, stale text) */
+        NVMTLTexture *rz = [(id)d.colorAttachments[0].resolveTexture isKindOfClass:[NVMTLTexture class]] ? (NVMTLTexture *)d.colorAttachments[0].resolveTexture : nil; NVMTLTexture *rzs = rz ? (rz->_parent ? rz->_parent : rz) : nil;
+        nvtrace("PASS target %ux%u surf %u view %d samples %u load %lu store %lu clear (%.3g %.3g %.3g %.3g) depth %d dload %lu dstore %lu | resolve %ux%u surf %u lvl %lu slice %lu | rt %lux%lu",
+            [sr nvi]->w, [sr nvi]->h,
+            sr->_surf ? (unsigned)IOSurfaceGetID(sr->_surf) : 0u, e->_target->_parent != nil, [e->_target nvi]->samples, (unsigned long)d.colorAttachments[0].loadAction,
             (unsigned long)d.colorAttachments[0].storeAction, d.colorAttachments[0].clearColor.red, d.colorAttachments[0].clearColor.green,
-            d.colorAttachments[0].clearColor.blue, d.colorAttachments[0].clearColor.alpha, d.depthAttachment.texture != nil);
+            d.colorAttachments[0].clearColor.blue, d.colorAttachments[0].clearColor.alpha, d.depthAttachment.texture != nil,
+            (unsigned long)d.depthAttachment.loadAction, (unsigned long)d.depthAttachment.storeAction,
+            rzs ? [rzs nvi]->w : 0u, rzs ? [rzs nvi]->h : 0u, (rzs && rzs->_surf) ? (unsigned)IOSurfaceGetID(rzs->_surf) : 0u,
+            (unsigned long)d.colorAttachments[0].resolveLevel, (unsigned long)d.colorAttachments[0].resolveSlice,
+            (unsigned long)d.renderTargetWidth, (unsigned long)d.renderTargetHeight);
         if (sr->_surf) {
             if (d.colorAttachments[0].loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(self, sr);
             else nvmtl_surface_in_for_cb(self, sr);
@@ -4698,20 +5068,30 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 
 - (void)pushDebugGroup:(NSString *)g {}
 - (void)popDebugGroup {}
-- (void)encodeSignalEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordSignal:e value:v]; }
-- (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordWait:e value:v]; }
+- (void)encodeSignalEvent:(id<MTLEvent>)e value:(uint64_t)v { nvtrace("EVENT signal %s %p -> %llu", object_getClassName(e), (__bridge void *)e, (unsigned long long)v); [self nvmtlRecordSignal:e value:v]; }
+- (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v { nvtrace("EVENT wait %s %p for %llu", object_getClassName(e), (__bridge void *)e, (unsigned long long)v); [self nvmtlRecordWait:e value:v]; }
 // The display-pipe swap follows this call immediately in WindowServer. NVAccel
 // cannot order that swap after an NVK fence, so wait for the pixels to finish
 // before allowing the surface to become scanout. Other applications keep the
 // normal submission-only contract.
 - (BOOL)commitAndWaitUntilSubmitted {
     static int ws = -1;
-    if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+    if (ws < 0) {
+        ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+        /* b97 test switch: the file /Library/GPUBundles/nvmtl-ws-nowait makes WindowServer wait only until its frame is
+           submitted, not finished (read once per WindowServer; re-arm to apply). Its main thread, which also handles
+           input, then never blocks on the GPU - at the price of the CPU copy to the panel sometimes catching a frame
+           the GPU has not finished (a flash or a torn frame). It answers one question: are the per-frame waits the lag? */
+        if (ws && access("/Library/GPUBundles/nvmtl-ws-nowait", F_OK) == 0) {
+            ws = 0;
+            nvlog("WindowServer: nvmtl-ws-nowait present - frames are NOT waited for before the swap (lag test)");
+        } else if (ws) nvlog("WindowServer: each frame is waited for before the swap (create /Library/GPUBundles/nvmtl-ws-nowait to test without)");
+    }
     [self commit];
     if (ws) [self waitUntilCompleted]; else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
-- (void)commit { [self nvmtlSubmitWithEvents]; }
+- (void)commit { nvtrace("COMMIT cb %p (%lu encoders)", (__bridge void *)self, (unsigned long)_nEnc); [self nvmtlSubmitWithEvents]; }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
 }
@@ -4781,10 +5161,32 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     [_completionCondition unlock];
     dispatch_group_wait(_callbackGroup, DISPATCH_TIME_FOREVER);
 }
+// 10-18 (Brave): Chromium, Dawn and ANGLE render into IOSurfaces, call waitUntilScheduled and hand the surface to
+// CoreAnimation, which WindowServer composites at once. On Apple's drivers the IOSurface IS the GPU memory and the
+// kernel orders WindowServer's reads after the GPU writes. Here the pixels reach the IOSurface only when the submission
+// finishes and surface-out copies them back, so "scheduled" came too early: WindowServer showed stale or empty tiles
+// (black boxes, flicker). A command buffer that wrote an IOSurface is "scheduled" only once its writes are published.
+// NVMTL_SCHED_EARLY=1 restores the old behaviour.
+static int nvmtl_sched_strict(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SCHED_EARLY"); on = !(e && e[0] == '1');
+        nvlog("waitUntilScheduled: %s (NVMTL_SCHED_EARLY=%s)", on ? "waits for IOSurface writes to be published" : "returns at submission", e ? e : "unset"); }
+    return on;
+}
 - (void)waitUntilScheduled {
     _nWait++; [_completionCondition lock];
+    if (_wroteSurface && nvmtl_sched_strict()) while (!_executionDone) [_completionCondition wait];
     while (!_wasScheduled && !_executionDone) [_completionCondition wait];
     [_completionCondition unlock];
+    /* 10-18 (zero-copy black boxes): Dawn and Skia often wait on their LAST command buffer, which need not be the one
+       that drew into the IOSurface. On Apple's drivers "scheduled" covers every earlier buffer of the queue and the
+       kernel orders WindowServer's reads; here WindowServer reads the pages directly, so wait until no IOSurface
+       writer of this process is still running (bounded: 250 ms, a stuck GPU must not freeze the browser). */
+    if (nvmtl_sched_strict() && __atomic_load_n(&nvmtl_surf_writers, __ATOMIC_SEQ_CST) > 0) {
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        while (__atomic_load_n(&nvmtl_surf_writers, __ATOMIC_SEQ_CST) > 0 &&
+               clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 < 250000000ull) usleep(100);
+    }
     dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
 }
 - (MTLCommandBufferStatus)status { [_completionCondition lock]; MTLCommandBufferStatus s = _cbstatus; [_completionCondition unlock]; return s; }

@@ -333,9 +333,21 @@ int nmx_drm_node_ioctl(struct linux_file *filp, unsigned long cmd, void *data)
 		sg->len = err ? 0 : (uint32_t)len;
 		return err;
 	}
-	if (df == NULL || df->minor == NULL || df->minor->dev == NULL || !dev_is_pci(df->minor->dev->dev))
+	if (df == NULL || df->minor == NULL || df->minor->dev == NULL || df->minor->dev->dev == NULL) {
+		printf("NullMoth drm: GET_PCIINFO: no DRM device behind this open (file %p)\n", df);
 		return ENODEV;
+	}
 	pdev = to_pci_dev(df->minor->dev->dev);
+	/*
+	 * FreeBSD's dev_is_pci() asks whether the device's newbus parent is in the "pci" devclass, which the port's newbus
+	 * does not give it: GET_PCIINFO answered ENODEV and libdrm (so Mesa ANV) found no GPU (Iris Xe, 10-16). Every DRM
+	 * device this kext creates is a PCI function, so accept it when the PCI identity is a GPU vendor's.
+	 */
+	if (!dev_is_pci(df->minor->dev->dev) && pdev->vendor != 0x8086 && pdev->vendor != 0x1002 && pdev->vendor != 0x10de &&
+	    pdev->vendor != 0x1022) {
+		printf("NullMoth drm: GET_PCIINFO: not a PCI device (vendor 0x%04x)\n", pdev->vendor);
+		return ENODEV;
+	}
 	memset(pi, 0, sizeof(*pi));
 	pi->domain = pci_domain_nr(pdev->bus);
 	pi->bus = pdev->bus->number;

@@ -47,6 +47,9 @@ static VkImageAspectFlags nvmtl_barrier_aspect(const nvk_image *img)
 #include <unistd.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 #include <pthread.h>
 static pthread_mutex_t g_gpu_clock_lock = PTHREAD_MUTEX_INITIALIZER;
 static inline const char *nvmtl_pick_vk(const char *staged, const char *dev) {
@@ -596,6 +599,7 @@ static void nvmtl_vkmsg_arm(void)
     }
 }
 
+#include "nvmtl_drmbridge.h"
 static int nvmtl_vk_initialize(void)
 {
     if (g_state) return g_state == 1 ? 0 : -1;
@@ -618,7 +622,20 @@ static int nvmtl_vk_initialize(void)
             }
         }
     }
+    /* b82: Mesa's anonymous files (ANV device creation) go to $XDG_RUNTIME_DIR, else /tmp/xdg-runtime-mesa-<uid>, which
+       it refuses when the owner is not the caller: WindowServer (uid 0, euid 88) failed vkCreateDevice with
+       "/tmp/xdg-runtime-mesa-0 exists but has wrong owner" (10-19). Point it at this process's own temp folder. */
+    if (!getenv("XDG_RUNTIME_DIR")) {
+        char td[PATH_MAX];
+        const size_t tn = confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td);
+        if (tn > 0 && tn <= sizeof td && access(td, W_OK) == 0) {
+            size_t l = strlen(td); if (l > 1 && td[l - 1] == '/') td[l - 1] = 0;
+            setenv("XDG_RUNTIME_DIR", td, 1);
+            nvlog("vk: XDG_RUNTIME_DIR for Mesa = %s (%s)", td, getprogname());
+        }
+    }
     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
+    if (g_lib && nvmtl_vk_vendor() != 0x10de) nmxbr_install();   /* b80: /dev/dri over IOKit where a sandbox refuses it */
     if (g_lib) {
         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
         if (!pvkGetInstanceProcAddr)
@@ -659,6 +676,29 @@ static int nvmtl_vk_initialize(void)
               (int)er, n, getprogname(), (unsigned)getuid(), (unsigned)geteuid(),
               er != VK_SUCCESS ? "the ENUMERATION failed, so NVK could not reach the device (not an absent GPU)"
                                : "the enumeration SUCCEEDED and found no device through this ICD");
+        {   /* b77: say WHY (WindowServer, 10-19: ANV found no device there although apps find it) - the node as this
+               process sees it: the directory listing, stat, open and the PCI-info ioctl libdrm uses */
+            struct stat st; int e;
+            DIR *d = opendir("/dev/dri"); e = errno;
+            if (!d) nvlog("vk: why-zero: opendir(/dev/dri) FAILED errno %d (%s)", e, strerror(e));
+            else { char names[256] = ""; struct dirent *de;
+                   while ((de = readdir(d))) { if (de->d_name[0] == '.') continue; strlcat(names, de->d_name, sizeof names); strlcat(names, " ", sizeof names); }
+                   closedir(d); nvlog("vk: why-zero: /dev/dri lists: %s", names[0] ? names : "(nothing)"); }
+            if (stat("/dev/dri/renderD128", &st)) { e = errno; nvlog("vk: why-zero: stat(renderD128) FAILED errno %d (%s)", e, strerror(e)); }
+            else nvlog("vk: why-zero: renderD128 mode 0%o uid %u gid %u char %d major %d", (unsigned)(st.st_mode & 07777), (unsigned)st.st_uid,
+                       (unsigned)st.st_gid, S_ISCHR(st.st_mode) ? 1 : 0, (int)major(st.st_rdev));
+            int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); e = errno;
+            if (fd < 0) nvlog("vk: why-zero: open(renderD128, O_RDWR) FAILED errno %d (%s)", e, strerror(e));
+            else {
+                struct { uint16_t domain; uint8_t bus, dev, func; uint16_t vendor_id, device_id, subvendor_id, subdevice_id; uint8_t revision_id; } pi;
+                memset(&pi, 0, sizeof pi);
+                int r = ioctl(fd, _IOR('d', 0x15, pi), &pi); e = errno;
+                nvlog("vk: why-zero: open OK; DRM_IOCTL_GET_PCIINFO -> %d%s%s, %04x:%04x at %u:%u.%u", r, r ? " errno " : "", r ? strerror(e) : "",
+                      pi.vendor_id, pi.device_id, pi.bus, pi.dev, pi.func);
+                close(fd);
+            }
+            nvlog("vk: why-zero: issetugid %d - Mesa ignores its environment variables in such a process", issetugid());
+        }
         return -1; }
     nvlog("vk: pdev %u physical device(s) through this ICD (VkResult %d)", n, (int)er);
     VkPhysicalDevice pds[8]; if (n > 8) n = 8; pvkEnumeratePhysicalDevices(g_inst, &n, pds); g_pdev = pds[0];
@@ -838,7 +878,13 @@ static int nvmtl_vk_initialize(void)
     nvlog("vk: tessellation %s, vertex-stage stores %s", g_tess ? "AVAILABLE" : "ABSENT", supported.vertexPipelineStoresAndAtomics ? "on" : "off");
     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, g_dyn3 ? (const void *)&dyn3 : (const void *)&v11, 0,
                                1, &qci, 0, NULL, next, next ? exts : NULL, &enabled };
-    VKCK(pvkCreateDevice(g_pdev, &dci, NULL, &g_dev), "vkCreateDevice");
+    {   /* b81: in a bridged process (WindowServer) Mesa's own reason for a failure is captured from stderr */
+        int br_saved = -1, br_p[2]; const int br_cap = nmxbr_err_begin(&br_saved, br_p);
+        if (br_cap) setenv("MESA_DEBUG", "1", 0);
+        VkResult cr = pvkCreateDevice(g_pdev, &dci, NULL, &g_dev);
+        if (br_cap) nmxbr_err_end(br_saved, br_p, cr == VK_SUCCESS ? "vkCreateDevice ok" : "vkCreateDevice FAILED");
+        VKCK(cr, "vkCreateDevice");
+    }
     DEVICE_FNS(LOAD_D)
     if (g_pstat) { p_pstat_props = (PFN_vkGetPipelineExecutablePropertiesKHR)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineExecutablePropertiesKHR");
                    p_pstat_stats = (PFN_vkGetPipelineExecutableStatisticsKHR)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineExecutableStatisticsKHR");
@@ -1268,6 +1314,7 @@ const char *nvmtl_image_ident(const void *addr, char *out, size_t n)
     return out;
 }
 
+static int g_host_mtype = -1;   /* the memory type host-pointer imports use: buffer-texture aliases over them need only that one */
 int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
 {
     if (nvmtl_vk_init()) return -1;
@@ -1309,6 +1356,7 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
         out->buf = NULL; out->mem = NULL; return -1; }
     out->map = ptr; out->alloc = size; out->imported = 1;
+    g_host_mtype = mt;
     g_alloc_bytes += size; g_buf_made++;
     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
     return 0;
@@ -1370,8 +1418,52 @@ static int nvmtl_vk_3d_slice_ok(VkFormat fmt, VkImageUsageFlags usage)
               (unsigned)fmt, (unsigned)usage, (int)r);
     return r == VK_SUCCESS;
 }
+/*
+ * b99: framebuffer fetch (Metal [[color(n)]], programmable blending). The translator lowers a fragment read of the
+ * colour being drawn to an input attachment at binding 192 + n (InputAttachmentIndex n), and this driver's set layout
+ * had no such binding: on the Intel GPU the read returned garbage, so WindowServer's text and translucent layers
+ * blended wrongly (dark fringes around text, 10-20). With it ON, every single-sample colour attachment is also input
+ * attachment n of its subpass (layout GENERAL, a by-region self-dependency), the set layout carries bindings 192..199,
+ * each draw's fragment set points them at the pass's colour views, and a draw whose shader reads them is preceded by
+ * a by-region barrier. Opt-in while it is proven: NVMTL_FBFETCH=1 or the file /Library/GPUBundles/nvmtl-fbfetch.
+ */
+#define NVMTL_FETCH_BINDING 192
+static int nvmtl_fbfetch_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_FBFETCH");
+        /* b114: ON by default. 10-21: with it off WindowServer's lock screen clock, date and vibrant text read nothing
+           from the screen and came out black; with /Library/GPUBundles/nvmtl-fbfetch the boot-armed lock screen drew
+           them. (Two hangs that day were WindowServer restarts by hand while logged in - those WindowServers stopped in
+           start-up, before their first framebuffer-fetch draw.) Off: NVMTL_FBFETCH=0 or the file nvmtl-nofbfetch. */
+        on = e ? (e[0] == '1') : (access("/Library/GPUBundles/nvmtl-nofbfetch", F_OK) != 0);
+        nvlog("vk: b99 framebuffer fetch (programmable blending) %s", on ? "ON - colour attachments are input attachments too (b114 default)"
+              : "off (NVMTL_FBFETCH=0 or the file /Library/GPUBundles/nvmtl-nofbfetch)");
+    }
+    return on;
+}
+static VkImageUsageFlags nvmtl_fetch_usage(VkImageType type, VkSampleCountFlagBits samples, VkImageUsageFlags usage)
+{
+    if (type == VK_IMAGE_TYPE_2D && samples == VK_SAMPLE_COUNT_1_BIT && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && nvmtl_fbfetch_on())
+        usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+    return usage;
+}
+static int nvmtl_spirv_uses_fetch(const void *p, size_t n)
+{
+    const uint32_t *w = (const uint32_t *)p; size_t nw = n / 4;
+    if (!p || nw < 5 || w[0] != 0x07230203u) return 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!wc || i + wc > nw) return 0;
+        if (op == 71 && wc == 4 && w[i + 2] == 33 && w[i + 3] >= NVMTL_FETCH_BINDING && w[i + 3] < NVMTL_FETCH_BINDING + NVMTL_NCOL) return 1;
+        i += wc;
+    }
+    return 0;
+}
 static void nvmtl_vk_image_mutable(VkImageCreateInfo *ici, nvk_image *out)
 {
+    ici->usage = nvmtl_fetch_usage(ici->imageType, ici->samples, ici->usage);
     ici->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     if (ici->imageType == VK_IMAGE_TYPE_2D && ici->samples == VK_SAMPLE_COUNT_1_BIT
         && nvmtl_vk_cube_compat(out->mtl_type, ici->extent.width, ici->extent.height, ici->arrayLayers))
@@ -1580,9 +1672,9 @@ static void nvmtl_vk_image_census(void)
               (unsigned long long)(nvmtl_vk_vram_bytes() >> 20), (unsigned long long)(bud >> 20), (unsigned long long)(used >> 20), m ? "measured" : "estimated",
               nvmtl_tex_objs_live(), nvmtl_tex_objs_released()); }
 }
-static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkDeviceMemory *mem, uint32_t *sysmem, const char *what)
+static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkDeviceMemory *mem, uint32_t *sysmem, const char *what, uint32_t *mtout)
 {
-    *sysmem = 0;
+    *sysmem = 0; *mtout = 0;
     int mt = memtype(mr->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt < 0) { nvlog("vk: no device-local memory type for the %s image", what); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
     VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr->size, (uint32_t)mt };
@@ -1624,22 +1716,210 @@ static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkDevic
                   (unsigned long long)g_spilled); }
         else nvlog("vk: %s image: VRAM full and no system-memory type takes it (bits 0x%x) -> %d", what, mr->memoryTypeBits, r);
     }
+    if (r == VK_SUCCESS) *mtout = mai.memoryTypeIndex + 1;
     return r;
 }
-static VkResult nvmtl_alloc_opaque_image_mem(const VkMemoryRequirements *mr, void **out, uint32_t *sysmem, const char *what)
+/*
+ * b121: image memory recycling. WindowServer's compositor creates and frees short-lived textures all the time (blur
+ * ping-pong surfaces, backdrop captures, render surfaces: ~280 allocations and as many frees in 20 s, nmx-bos 10-21);
+ * each one was a new GPU buffer object (kernel create, page clearing, binding) and a free. A freed image's memory now
+ * waits here for 150 ms (so the GPU is long done with it) and is handed to the next image needing the same size and a
+ * compatible memory type. Entries older than 2 s are freed, at most 32 entries / 96 MB are kept (each kept one is still
+ * a buffer object listed in every submission). Off: touch /Library/GPUBundles/nvmtl-noimgrecycle.
+ */
+#define NVMTL_IMC_MAX 32
+#define NVMTL_IMC_BYTES (96ull << 20)
+typedef struct { VkDeviceMemory mem; uint64_t size; uint32_t sysmem, mt; uint64_t t; } nvmtl_imc_t;
+static nvmtl_imc_t g_imc[NVMTL_IMC_MAX];
+static unsigned g_nimc; static uint64_t g_imc_bytes;
+static pthread_mutex_t g_imc_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long g_imc_hit, g_imc_put, g_imc_aged;
+static int nvmtl_imc_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_IMG_RECYCLE");
+                  on = e ? (e[0] == '1') : (access("/Library/GPUBundles/nvmtl-noimgrecycle", F_OK) != 0); }
+    return on;
+}
+static uint64_t nvmtl_imc_now(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW); }
+/* caller holds g_imc_lock; drops entries older than 2 s into 'out' (freed by the caller outside the lock) */
+static unsigned nvmtl_imc_age_locked(uint64_t now, VkDeviceMemory *out, unsigned cap)
+{
+    unsigned n = 0;
+    for (unsigned k = 0; k < g_nimc && n < cap;) {
+        if (now - g_imc[k].t > 2000000000ull) {
+            out[n++] = g_imc[k].mem; g_imc_bytes -= g_imc[k].size; g_imc_aged++;
+            g_imc[k] = g_imc[--g_nimc];
+        } else k++;
+    }
+    return n;
+}
+static int nvmtl_imc_take(const VkMemoryRequirements *mr, VkDeviceMemory *mem, uint32_t *sysmem, uint32_t *mt1)
+{
+    if (!nvmtl_imc_on() || !g_nimc) return -1;
+    const uint64_t now = nvmtl_imc_now(); int got = -1;
+    VkDeviceMemory old[NVMTL_IMC_MAX]; unsigned nold;
+    pthread_mutex_lock(&g_imc_lock);
+    for (unsigned k = 0; k < g_nimc; k++) {
+        nvmtl_imc_t *e = &g_imc[k];
+        if (e->size != mr->size || !(mr->memoryTypeBits & (1u << e->mt)) || now - e->t < 150000000ull) continue;
+        *mem = e->mem; *sysmem = e->sysmem; *mt1 = e->mt + 1; g_imc_bytes -= e->size; g_imc_hit++;
+        g_imc[k] = g_imc[--g_nimc]; got = 0; break;
+    }
+    nold = nvmtl_imc_age_locked(now, old, NVMTL_IMC_MAX);
+    pthread_mutex_unlock(&g_imc_lock);
+    for (unsigned k = 0; k < nold; k++) pvkFreeMemory(g_dev, old[k], NULL);
+    return got;
+}
+/* 0 = kept (the caller must not free it) */
+static int nvmtl_imc_put(VkDeviceMemory mem, uint64_t size, uint32_t sysmem, uint32_t mt1)
+{
+    if (!nvmtl_imc_on() || !mem || !mt1 || size > NVMTL_IMC_BYTES / 4) return -1;
+    const uint64_t now = nvmtl_imc_now(); int kept = -1;
+    VkDeviceMemory old[NVMTL_IMC_MAX + 1]; unsigned nold;
+    pthread_mutex_lock(&g_imc_lock);
+    nold = nvmtl_imc_age_locked(now, old, NVMTL_IMC_MAX);
+    while (g_nimc && (g_nimc == NVMTL_IMC_MAX || g_imc_bytes + size > NVMTL_IMC_BYTES)) {   /* drop the oldest */
+        unsigned o = 0; for (unsigned k = 1; k < g_nimc; k++) if (g_imc[k].t < g_imc[o].t) o = k;
+        if (nold < NVMTL_IMC_MAX + 1) old[nold++] = g_imc[o].mem; else break;
+        g_imc_bytes -= g_imc[o].size; g_imc[o] = g_imc[--g_nimc];
+    }
+    if (g_nimc < NVMTL_IMC_MAX && g_imc_bytes + size <= NVMTL_IMC_BYTES) {
+        g_imc[g_nimc++] = (nvmtl_imc_t){ mem, size, sysmem, mt1 - 1, now }; g_imc_bytes += size; g_imc_put++; kept = 0;
+        if (!(g_imc_put & 0x3fff)) nvlog("vk: image memory recycling: %lu kept, %lu reused, %lu aged out; %u held (%llu MB)",
+                                         g_imc_put, g_imc_hit, g_imc_aged, g_nimc, (unsigned long long)(g_imc_bytes >> 20));
+    }
+    pthread_mutex_unlock(&g_imc_lock);
+    for (unsigned k = 0; k < nold; k++) pvkFreeMemory(g_dev, old[k], NULL);
+    return kept;
+}
+static VkResult nvmtl_alloc_opaque_image_mem(const VkMemoryRequirements *mr, void **out, uint32_t *sysmem, const char *what, uint32_t *imt)
 {
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkResult result = nvmtl_vk_alloc_image_mem(mr, &memory, sysmem, what);
+    uint32_t mt1 = 0;
+    VkResult result = nvmtl_imc_take(mr, &memory, sysmem, &mt1) == 0 ? VK_SUCCESS
+                    : nvmtl_vk_alloc_image_mem(mr, &memory, sysmem, what, &mt1);
     if (result == VK_SUCCESS) {
-        *out = memory;
+        *out = memory; *imt = mt1;
         if (!*sysmem) nvmtl_vk_budget_charge(mr->size);
     }
     return result;
+}
+/*
+ * b122: small-image sub-allocation. WindowServer creates hundreds of small textures (icons, glyph runs, blur and
+ * backdrop surfaces) per 20 s; each had its own GPU memory object = one more buffer object listed in EVERY GPU
+ * submission (~550 per submission, ~1 ms of kernel time each) plus a kernel create/destroy. Colour images up to 1 MB now
+ * take a range of a shared 16 MB block (4 KB units, the image's alignment respected); a freed range waits 150 ms before
+ * it is reused. At most 16 blocks; anything that does not fit gets its own memory as before.
+ * Off: touch /Library/GPUBundles/nvmtl-noslab.
+ */
+#define NVMTL_SLAB_BLOCK  (16ull << 20)
+#define NVMTL_SLAB_UNIT   4096ull
+#define NVMTL_SLAB_UNITS  ((unsigned)(NVMTL_SLAB_BLOCK / NVMTL_SLAB_UNIT))
+#define NVMTL_SLAB_MAXOBJ (1ull << 20)
+#define NVMTL_SLAB_MAXBLK 16
+#define NVMTL_SLAB_QMAX   2048
+typedef struct { VkDeviceMemory mem; uint32_t mt, sysmem; uint64_t bits[NVMTL_SLAB_UNITS / 64]; unsigned used; } nvmtl_slab;
+typedef struct { nvmtl_slab *s; uint32_t u0, n; uint64_t t; } nvmtl_slabq;
+static nvmtl_slab *g_slabs[NVMTL_SLAB_MAXBLK]; static unsigned g_nslabs;
+static nvmtl_slabq g_slabq[NVMTL_SLAB_QMAX]; static unsigned g_nslabq;
+static pthread_mutex_t g_slab_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long g_slab_allocs, g_slab_frees, g_slab_misses;
+static int nvmtl_slab_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SLAB");
+                  on = e ? (e[0] == '1') : (access("/Library/GPUBundles/nvmtl-noslab", F_OK) != 0);
+                  nvlog("vk: small-image sub-allocation %s (b122)", on ? "ON (16 MB blocks)" : "OFF"); }
+    return on;
+}
+static void nvmtl_slab_mark(nvmtl_slab *s, uint32_t u0, uint32_t n, int set)
+{
+    for (uint32_t u = u0; u < u0 + n; u++) {
+        if (set) s->bits[u >> 6] |= 1ull << (u & 63); else s->bits[u >> 6] &= ~(1ull << (u & 63));
+    }
+    if (set) s->used += n; else s->used -= n;
+}
+/* caller holds g_slab_lock: ranges freed more than 150 ms ago become free again */
+static void nvmtl_slab_reclaim_locked(uint64_t now)
+{
+    for (unsigned k = 0; k < g_nslabq;) {
+        if (now - g_slabq[k].t >= 150000000ull) { nvmtl_slab_mark(g_slabq[k].s, g_slabq[k].u0, g_slabq[k].n, 0); g_slabq[k] = g_slabq[--g_nslabq]; }
+        else k++;
+    }
+}
+static int nvmtl_slab_find(nvmtl_slab *s, uint32_t n, uint32_t a, uint32_t *u0)
+{
+    if (NVMTL_SLAB_UNITS - s->used < n) return -1;
+    for (uint32_t u = 0; u + n <= NVMTL_SLAB_UNITS; u += a) {
+        uint32_t k = 0;
+        while (k < n && !((s->bits[(u + k) >> 6] >> ((u + k) & 63)) & 1)) k++;
+        if (k == n) { *u0 = u; return 0; }
+        u += k & ~(a - 1);      /* skip past the used unit (stays aligned) */
+    }
+    return -1;
+}
+static int nvmtl_slab_alloc(const VkMemoryRequirements *mr, void **mem, uint64_t *off, void **slab, uint32_t *sysmem)
+{
+    if (!nvmtl_slab_on() || mr->size > NVMTL_SLAB_MAXOBJ || mr->alignment > (64u << 10) || !mr->size) return -1;
+    const uint32_t n = (uint32_t)((mr->size + NVMTL_SLAB_UNIT - 1) / NVMTL_SLAB_UNIT);
+    uint32_t a = (uint32_t)(mr->alignment / NVMTL_SLAB_UNIT); if (!a) a = 1;
+    if (a & (a - 1)) return -1;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    pthread_mutex_lock(&g_slab_lock);
+    nvmtl_slab_reclaim_locked(now);
+    for (unsigned b = 0; b < g_nslabs; b++) {
+        nvmtl_slab *s = g_slabs[b]; uint32_t u0;
+        if (!(mr->memoryTypeBits & (1u << s->mt)) || nvmtl_slab_find(s, n, a, &u0)) continue;
+        nvmtl_slab_mark(s, u0, n, 1); g_slab_allocs++;
+        *mem = s->mem; *off = (uint64_t)u0 * NVMTL_SLAB_UNIT; *slab = s; *sysmem = s->sysmem;
+        pthread_mutex_unlock(&g_slab_lock);
+        return 0;
+    }
+    if (g_nslabs == NVMTL_SLAB_MAXBLK) { g_slab_misses++; pthread_mutex_unlock(&g_slab_lock); return -1; }
+    pthread_mutex_unlock(&g_slab_lock);
+    /* a new block is allocated OUTSIDE the lock: the allocator may evict images, whose destruction frees ranges here */
+    nvmtl_slab *s = calloc(1, sizeof *s);
+    VkMemoryRequirements bm = { NVMTL_SLAB_BLOCK, 64u << 10, mr->memoryTypeBits };
+    uint32_t mt1 = 0, sm = 0; VkDeviceMemory m = VK_NULL_HANDLE;
+    if (!s || nvmtl_vk_alloc_image_mem(&bm, &m, &sm, "shared small-image block", &mt1) != VK_SUCCESS || !mt1) {
+        if (m) pvkFreeMemory(g_dev, m, NULL);
+        free(s); pthread_mutex_lock(&g_slab_lock); g_slab_misses++; pthread_mutex_unlock(&g_slab_lock); return -1; }
+    pthread_mutex_lock(&g_slab_lock);
+    if (g_nslabs == NVMTL_SLAB_MAXBLK) {           /* another thread filled the table meanwhile */
+        g_slab_misses++; pthread_mutex_unlock(&g_slab_lock); pvkFreeMemory(g_dev, m, NULL); free(s); return -1; }
+    s->mem = m; s->mt = mt1 - 1; s->sysmem = sm; g_slabs[g_nslabs++] = s;
+    if (!sm) nvmtl_vk_budget_charge(NVMTL_SLAB_BLOCK);
+    nvlog("vk: shared small-image block %u opened (16 MB, memory type %u%s) - %lu images placed so far",
+          g_nslabs, s->mt, sm ? ", system memory" : "", g_slab_allocs);
+    nvmtl_slab_mark(s, 0, n, 1); g_slab_allocs++;
+    *mem = s->mem; *off = 0; *slab = s; *sysmem = s->sysmem;
+    pthread_mutex_unlock(&g_slab_lock);
+    return 0;
+}
+/* 'now' = 0: the range was never used by the GPU (failed creation) - free at once */
+static void nvmtl_slab_free(void *slab, uint64_t off, uint64_t size, int now0)
+{
+    nvmtl_slab *s = slab;
+    if (!s || !size) return;
+    const uint32_t u0 = (uint32_t)(off / NVMTL_SLAB_UNIT), n = (uint32_t)((size + NVMTL_SLAB_UNIT - 1) / NVMTL_SLAB_UNIT);
+    pthread_mutex_lock(&g_slab_lock);
+    g_slab_frees++;
+    if (now0) nvmtl_slab_mark(s, u0, n, 0);
+    else {
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (g_nslabq == NVMTL_SLAB_QMAX) nvmtl_slab_reclaim_locked(now);
+        if (g_nslabq < NVMTL_SLAB_QMAX) g_slabq[g_nslabq++] = (nvmtl_slabq){ s, u0, n, now };
+        else { static int said; if (!said++) nvlog("vk: small-image quarantine full - a range is LEAKED until the block is reused (said once)"); }
+    }
+    if (!(g_slab_frees & 0x3fff)) nvlog("vk: small-image blocks: %u open, %lu placed, %lu freed, %lu did not fit", g_nslabs, g_slab_allocs, g_slab_frees, g_slab_misses);
+    pthread_mutex_unlock(&g_slab_lock);
 }
 static void nvmtl_failed_image(nvk_image *image)
 {
     if (image->view) pvkDestroyImageView(g_dev, (VkImageView)image->view, NULL);
     if (image->img) pvkDestroyImage(g_dev, (VkImage)image->img, NULL);
+    if (image->placed == 2) nvmtl_slab_free(image->slab, image->soff, image->alloc, 1);
     if (image->mem && !image->placed) {
         pvkFreeMemory(g_dev, (VkDeviceMemory)image->mem, NULL);
 
@@ -1684,7 +1964,7 @@ static int nvmtl_vk_image_create_ms_lifetime_body(uint32_t w, uint32_t h, uint32
     nvmtl_vk_image_mutable(&ici, out);
     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(ms)");
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "multisample"), "vkAllocateMemory(ms)");
+    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "multisample", &out->imt), "vkAllocateMemory(ms)");
     out->alloc = mr.size;
     VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory(ms)");
     VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, out->img, mtl_type == 8 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, (VkFormat)vkfmt,
@@ -1722,9 +2002,14 @@ static int nvmtl_vk_image_create_typed_lifetime_body(uint32_t w, uint32_t h, uin
     nvmtl_vk_image_mutable(&ici, out);
     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage");
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "colour"), "vkAllocateMemory(image)");
+    if (nvmtl_slab_alloc(&mr, &out->mem, &out->soff, &out->slab, &out->sysmem) == 0) {      /* b122 */
+        out->placed = 2; out->alloc = mr.size;
+        VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, out->soff), "vkBindImageMemory(shared block)");
+    } else {
+    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "colour", &out->imt), "vkAllocateMemory(image)");
     out->alloc = mr.size;
     VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory");
+    }
     VkComponentMapping swz = a8 ? (VkComponentMapping){ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R }
                                 : (VkComponentMapping){ 0, 0, 0, 0 };
     VkImageViewType viewType = mtl_type == 0 ? VK_IMAGE_VIEW_TYPE_1D : mtl_type == 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : mtl_type == 3 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
@@ -1917,6 +2202,35 @@ static VkDescriptorSetLayout g_setLayout;
 static VkDescriptorPool      g_descPools[NVMTL_MAX_POOLS];
 static unsigned              g_ndescPools;
 static pthread_mutex_t       g_desc_lock = PTHREAD_MUTEX_INITIALIZER;
+/* b119: descriptor-set recycling. WindowServer draws allocate one set per stage per draw and freed them all when the
+   command buffer retired: anv_AllocateDescriptorSets (host zalloc + bzero of the whole layout) and
+   anv_descriptor_set_destroy (free) were ~25 % of WindowServer's CPU while animating (nmx-wsprof 10-21). Retired sets
+   now go on this stack (same layout, pools are never reset or destroyed) and the next allocation takes one from it;
+   every binding a pipeline uses is rewritten on each snapshot, so a recycled set's old contents are never read.
+   Off: touch /Library/GPUBundles/nvmtl-norecycle (or NVMTL_DESC_RECYCLE=0). Guarded by g_desc_lock. */
+#define NVMTL_RECYCLE_MAX 8192
+static nvk_setref g_recyc[NVMTL_RECYCLE_MAX];
+static unsigned   g_nrecyc;
+static unsigned long g_recyc_hits, g_recyc_put, g_recyc_freed;
+static int nvmtl_desc_recycle_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_DESC_RECYCLE");
+                  on = e ? (e[0] == '1') : (access("/Library/GPUBundles/nvmtl-norecycle", F_OK) != 0); }
+    return on;
+}
+/* caller holds g_desc_lock: keeps the set for reuse, or frees it when the stack is full / recycling is off */
+static void nvmtl_desc_give_back_locked(VkDescriptorPool p, VkDescriptorSet s)
+{
+    if (nvmtl_desc_recycle_on() && g_nrecyc < NVMTL_RECYCLE_MAX) {
+        g_recyc[g_nrecyc++] = (nvk_setref){ (void *)p, (void *)s }; g_recyc_put++;
+        if (!(g_recyc_put & 0xfffff)) nvlog("vk: descriptor recycling: %lu reused, %lu kept, %lu freed, %u on the stack",
+                                            g_recyc_hits, g_recyc_put, g_recyc_freed, g_nrecyc);
+        return;
+    }
+    g_recyc_freed++;
+    pvkFreeDescriptorSets(g_dev, p, 1, &s);
+}
 static unsigned              g_peak_sets, g_peak_fbs;
 static nvk_buffer            g_dummyBuf;
 static nvk_image             g_dummyImg;
@@ -2098,14 +2412,15 @@ static int nvmtl_desc_pool_open(void)
         nvlog("vk: descriptor pool CEILING: %u pools x %d sets all live in one frame — draws are being skipped", g_ndescPools, NVMTL_MAX_SETS);
         return -1;
     }
-    VkDescriptorPoolSize sizes[5] = {
+    VkDescriptorPoolSize sizes[6] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NVMTL_MAX_SETS },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (NVMTL_NBUF + 1) * NVMTL_MAX_SETS },
         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  NVMTL_NTEX  * NVMTL_MAX_SETS },
         { VK_DESCRIPTOR_TYPE_SAMPLER,        NVMTL_NSAMP * NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  NVMTL_NSTEX * NVMTL_MAX_SETS } };
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  NVMTL_NSTEX * NVMTL_MAX_SETS },
+        { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, NVMTL_NCOL * NVMTL_MAX_SETS } };   /* b99 */
     VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL,
-        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, NVMTL_MAX_SETS, 5, sizes };
+        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, NVMTL_MAX_SETS, nvmtl_fbfetch_on() ? 6u : 5u, sizes };
     static const VkDescriptorType mut4[4] = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
                                               VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER };
     VkMutableDescriptorTypeListEXT plists[5] = { { 0, NULL }, { 0, NULL }, { 4, mut4 }, { 0, NULL }, { 4, mut4 } };
@@ -2125,12 +2440,16 @@ static int ensure_descriptors_locked(void)
 {
     if (g_descriptor_state) return g_descriptor_state == 1 ? 0 : -1;
     g_descriptor_state = -1;
-    VkDescriptorSetLayoutBinding b[NVMTL_NBIND];
+    VkDescriptorSetLayoutBinding b[NVMTL_NBIND + NVMTL_NCOL];
     for (uint32_t i = 0; i < NVMTL_NBIND; i++) {
         b[i].binding = NVMTL_BINDING_NUMBER(i); b[i].descriptorType = binding_type(i); b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_ALL; b[i].pImmutableSamplers = NULL;
     }
-    VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, NVMTL_NBIND, b };
+    uint32_t nb = NVMTL_NBIND;
+    if (nvmtl_fbfetch_on())   /* b99: [[color(n)]] -> input attachment at binding 192 + n */
+        for (uint32_t k = 0; k < NVMTL_NCOL; k++)
+            b[nb++] = (VkDescriptorSetLayoutBinding){ NVMTL_FETCH_BINDING + k, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, nb, b };
     static const VkDescriptorType texTypes[2] = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER };
     static const VkDescriptorType stexTypes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER };
     static VkMutableDescriptorTypeListEXT mlists[NVMTL_NBIND];
@@ -2586,6 +2905,18 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     } else {
         pthread_mutex_lock(&g_desc_lock);
         if (ensure_descriptors_locked()) { pthread_mutex_unlock(&g_desc_lock); c->skipped++; return VK_NULL_HANDLE; }
+        if (nvmtl_desc_recycle_on() && g_nrecyc) {      /* b119 */
+            const nvk_setref rs = g_recyc[--g_nrecyc];
+            if (c->nsets == c->capsets) {
+                unsigned cap = c->capsets ? c->capsets * 2 : 64;
+                nvk_setref *grown = (nvk_setref *)realloc(c->sets, cap * sizeof *grown);
+                if (grown) { c->sets = grown; c->capsets = cap; }
+            }
+            if (c->nsets < c->capsets) { set = (VkDescriptorSet)rs.set; pool = (VkDescriptorPool)rs.pool; r = VK_SUCCESS; g_recyc_hits++; }
+            else { g_recyc[g_nrecyc++] = rs; r = VK_ERROR_OUT_OF_HOST_MEMORY; }
+            pthread_mutex_unlock(&g_desc_lock);
+            goto have_set;
+        }
         unsigned n = nvmtl_desc_batch();
         VkDescriptorSetLayout ls[NVMTL_DESC_BATCH_MAX];
         VkDescriptorSet got[NVMTL_DESC_BATCH_MAX];
@@ -2625,12 +2956,14 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         }
         pthread_mutex_unlock(&g_desc_lock);
     }
+have_set:
     if (r != VK_SUCCESS) {
         nvlog("vk: descriptor set allocation FAILED (%d) with %u pools — this draw is SKIPPED, not recorded blind", r, g_ndescPools);
         c->skipped++; return VK_NULL_HANDLE;
     }
     c->sets[c->nsets++] = (nvk_setref){ pool, set };
-    VkWriteDescriptorSet w[NVMTL_NBIND];
+    VkWriteDescriptorSet w[NVMTL_NBIND + NVMTL_NCOL];
+    VkDescriptorImageInfo fi[NVMTL_NCOL];
     VkCopyDescriptorSet cp[NVMTL_NBIND]; uint32_t ncp = 0;
     if (!from) copym = NULL;
     VkDescriptorBufferInfo bi[NVMTL_NBIND];
@@ -2691,6 +3024,12 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         ii[i] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, (VkImageView)view, VK_IMAGE_LAYOUT_GENERAL };
         w[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, NVMTL_BINDING_NUMBER(i), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[i], NULL, NULL };
     }
+    if (which == 1 && nvmtl_fbfetch_on() && c->fetch_rp)   /* b99: the pass's colour views as input attachments */
+        for (uint32_t k = 0; k < NVMTL_NCOL; k++) {
+            if (!c->fetch_view[k]) continue;
+            fi[k] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, (VkImageView)c->fetch_view[k], VK_IMAGE_LAYOUT_GENERAL };
+            w[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, NVMTL_FETCH_BINDING + k, 0, 1, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &fi[k], NULL, NULL };
+        }
     nvmtl_enc78_count(E78C_WRITES, nw);
     pvkUpdateDescriptorSets(g_dev, nw, w, ncp, cp);
     return set;
@@ -2836,7 +3175,7 @@ static int nvmtl_vk_depth_create_full_lifetime_body(uint32_t w, uint32_t h, uint
     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(depth)");
     out->usage = (uint32_t)ici.usage;
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "depth"), "vkAllocateMemory(depth)");
+    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "depth", &out->imt), "vkAllocateMemory(depth)");
     out->alloc = mr.size;
     VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory(depth)");
     VkImageViewType vt = out->mtl_type == 3 || out->mtl_type == 8 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : out->mtl_type == 5 ? VK_IMAGE_VIEW_TYPE_CUBE
@@ -3097,14 +3436,22 @@ static VkResult nvmtl_make_render_pass(const nvk_pipeline *p, uint32_t load, VkR
             VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL };
     }
-    VkSubpassDescription sp = { 0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, ncol, ncol ? cref : NULL, anyres ? rref : NULL,
+    /* b99: framebuffer fetch - each colour attachment is also input attachment i (layout GENERAL), with a by-region
+       self-dependency for the barrier a fetching draw records. Single-sample passes only: every render pass and every
+       pipeline's pass come from here, so they stay compatible. */
+    const int fetch = !ms && ncol && nvmtl_fbfetch_on();
+    VkAttachmentReference iref[NVMTL_NCOL];
+    for (uint32_t i = 0; fetch && i < ncol; i++) { if (cref[i].attachment != VK_ATTACHMENT_UNUSED) cref[i].layout = VK_IMAGE_LAYOUT_GENERAL; iref[i] = cref[i]; }
+    VkSubpassDescription sp = { 0, VK_PIPELINE_BIND_POINT_GRAPHICS, fetch ? ncol : 0, fetch ? iref : NULL, ncol, ncol ? cref : NULL, anyres ? rref : NULL,
         p->has_depth ? &dref : NULL, 0, NULL };
-    const VkSubpassDependency deps[2] = {
+    const VkSubpassDependency deps[3] = {
         { VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
           VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 },
         { 0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-          VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 } };
-    VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, n, atts, 1, &sp, 2, deps };
+          VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 },
+        { 0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, VK_DEPENDENCY_BY_REGION_BIT } };
+    VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, n, atts, 1, &sp, fetch ? 3u : 2u, deps };
     return pvkCreateRenderPass(g_dev, &rpci, NULL, out);
 }
 int nvmtl_vk_pipeline_create_blend(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vkfmt, uint32_t depthfmt, const nvk_blend_state *blend, nvk_pipeline *out)
@@ -3588,6 +3935,8 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
     out->rp = pass;
 
     if (!nvmtl_spirv_ok(vs, vn, "vertex module") || !nvmtl_spirv_ok(fs, fn, "fragment module")) return -1;
+    out->fetch = samples == 1 && nvmtl_fbfetch_on() && nvmtl_spirv_uses_fetch(fs, fn);   /* b99 */
+    if (out->fetch) { static unsigned said; if (said++ < 8) nvlog("vk: b99 pipeline reads [[color(n)]] - its draws read the pass's colour as an input attachment"); }
     if (!td) out->gmask_ok = (uint32_t)(nvmtl_spirv_bmask(vs, vn, out->gmask[0]) && nvmtl_spirv_bmask(fs, fn, out->gmask[1]));
     VkShaderModuleCreateInfo vsm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, vn, (const uint32_t *)vs };
     uint32_t *fcopy = (uint32_t *)malloc(fn);
@@ -4432,6 +4781,14 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
       } }
     pvkCmdBeginRenderPass(c->cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     c->in_rp = 1;
+    /* b99: this pass's colour views, for the input-attachment descriptors of fetching draws (single-sample passes made
+       by nvmtl_make_render_pass only - those carry the input attachments and the self-dependency) */
+    memset(c->fetch_view, 0, sizeof c->fetch_view);
+    c->fetch_rp = !rpShape && p->samples <= 1 && ncol && nvmtl_fbfetch_on();
+    for (uint32_t i = 0; c->fetch_rp && i < ncol && i < NVMTL_NCOL; i++)
+        if (cf[i] && ps->col[i] && (ps->col[i]->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) c->fetch_view[i] = ps->colview[i];
+    if (c->fetch_rp && c->table) ((nvmtl_bindtable *)c->table)->dirty[1] = 1;   /* no fragment set from another pass */
+    c->fetch_pipe = p->fetch;
     if (p->pipe) pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
     VkViewport vp = { 0, (float)ps->h, (float)ps->w, -(float)ps->h, 0, 1 }; VkRect2D sc = { { 0, 0 }, { ps->w, ps->h } };
     pvkCmdSetViewport(c->cb, 0, 1, &vp); pvkCmdSetScissor(c->cb, 0, 1, &sc);
@@ -4813,11 +5170,22 @@ int nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4]
     return 0;
 }
 
+static void nvmtl_fetch_barrier(nvk_cmdbuf *c);
 void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t instances, uint32_t baseInstance)
-{ if (c->nobind) return; pvkCmdDraw(c->cb, count, instances ? instances : 1, first, baseInstance); }
+{ if (c->nobind) return; nvmtl_fetch_barrier(c); pvkCmdDraw(c->cb, count, instances ? instances : 1, first, baseInstance); }
 void nvmtl_vk_cmd_set_scissor(nvk_cmdbuf *c, int32_t x, int32_t y, uint32_t w, uint32_t h)
 { VkRect2D r = { { x, y }, { w, h } }; pvkCmdSetScissor(c->cb, 0, 1, &r); }
-void nvmtl_vk_cmd_bind_pipeline(nvk_cmdbuf *c, nvk_pipeline *p) { pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)p->pipe); }
+void nvmtl_vk_cmd_bind_pipeline(nvk_cmdbuf *c, nvk_pipeline *p) { c->fetch_pipe = p->fetch; pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)p->pipe); }
+/* b99: a draw that reads [[color(n)]] sees everything drawn before it in this pass (Metal's raster-order guarantee for
+   framebuffer fetch is per pixel; a by-region barrier gives the same order between draws) */
+static void nvmtl_fetch_barrier(nvk_cmdbuf *c)
+{
+    if (!c->fetch_pipe || !c->fetch_rp || !c->in_rp) return;
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT,
+                          1, &mb, 0, NULL, 0, NULL);
+    static unsigned said; if (said++ < 3) nvlog("vk: b99 framebuffer fetch draw: by-region barrier recorded (views %p %p)", c->fetch_view[0], c->fetch_view[1]);
+}
 int nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType) {
     static const VkPrimitiveTopology map[5] = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
         VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
@@ -4874,6 +5242,7 @@ void nvmtl_vk_cmd_draw_indexed(nvk_cmdbuf *c, nvk_buffer *idx, size_t offset, ui
     if (!nvmtl_index_range_ok(idx, offset)) return;
     pvkCmdBindIndexBuffer(c->cb, (VkBuffer)idx->buf, offset, is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
     if (c->nobind) return;
+    nvmtl_fetch_barrier(c);
     pvkCmdDrawIndexed(c->cb, count, instances ? instances : 1, 0, baseVertex, baseInstance);
 }
 
@@ -4925,7 +5294,7 @@ int nvmtl_pt_armed(void)
     return g_pt_left > 0;
 }
 void nvmtl_vk_cmd_end_render(nvk_cmdbuf *c) {
-    pvkCmdEndRenderPass(c->cb); c->in_rp = 0;
+    pvkCmdEndRenderPass(c->cb); c->in_rp = 0; c->fetch_rp = 0; memset(c->fetch_view, 0, sizeof c->fetch_view);
     if (c->pt_open && c->pt_pool) { pvkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, (VkQueryPool)c->pt_pool, 2 * c->pt_n + 1); c->pt_n++; c->pt_open = 0; g_pt_left--; }
     (void)nvmtl_counter_flush(c); }
 
@@ -4943,13 +5312,23 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
     free(c->rvs); c->rvs = NULL; c->nrv = c->caprv = 0;
     if (c->ndcache) {
         pthread_mutex_lock(&g_desc_lock);
+        if (nvmtl_desc_recycle_on()) {      /* b119 */
+            for (unsigned i = 0; i < c->ndcache && i < NVMTL_DESC_BATCH_MAX; i++)
+                nvmtl_desc_give_back_locked((VkDescriptorPool)c->dcachepool, (VkDescriptorSet)c->dcache[i]);
+        } else {
         VkDescriptorSet back[NVMTL_DESC_BATCH_MAX];
         for (unsigned i = 0; i < c->ndcache && i < NVMTL_DESC_BATCH_MAX; i++) back[i] = (VkDescriptorSet)c->dcache[i];
         pvkFreeDescriptorSets(g_dev, (VkDescriptorPool)c->dcachepool, c->ndcache, back);
+        }
         pthread_mutex_unlock(&g_desc_lock);
         c->ndcache = 0; c->dcachepool = NULL;
     }
-    if (c->nsets) {
+    if (c->nsets && nvmtl_desc_recycle_on()) {      /* b119 */
+        pthread_mutex_lock(&g_desc_lock);
+        for (unsigned i = 0; i < c->nsets; i++)
+            nvmtl_desc_give_back_locked((VkDescriptorPool)c->sets[i].pool, (VkDescriptorSet)c->sets[i].set);
+        pthread_mutex_unlock(&g_desc_lock);
+    } else if (c->nsets) {
         pthread_mutex_lock(&g_desc_lock);
         for (unsigned i = 0; i < c->nsets;) {
             VkDescriptorPool p = (VkDescriptorPool)c->sets[i].pool; VkDescriptorSet run[256]; unsigned n = 0;
@@ -5281,7 +5660,8 @@ void nvmtl_vk_image_destroy(nvk_image *i)
     g_img_gone++;
     if (i->view) pvkDestroyImageView(g_dev, (VkImageView)i->view, NULL);
     pvkDestroyImage(g_dev, (VkImage)i->img, NULL);
-    if (!i->placed && i->mem) { pvkFreeMemory(g_dev, (VkDeviceMemory)i->mem, NULL); g_alloc_bytes -= i->alloc; if (i->sysmem) { g_sys_bytes -= i->alloc; g_sys_align -= (i->alloc + 65535ull) & ~65535ull; } else { g_vram_bytes -= i->alloc; g_img_align -= (i->alloc + 65535ull) & ~65535ull; }    }
+    if (i->placed == 2) nvmtl_slab_free(i->slab, i->soff, i->alloc, 0);      /* b122 */
+    if (!i->placed && i->mem) { if (nvmtl_imc_put((VkDeviceMemory)i->mem, i->alloc, i->sysmem, i->imt) != 0) pvkFreeMemory(g_dev, (VkDeviceMemory)i->mem, NULL); g_alloc_bytes -= i->alloc; if (i->sysmem) { g_sys_bytes -= i->alloc; g_sys_align -= (i->alloc + 65535ull) & ~65535ull; } else { g_vram_bytes -= i->alloc; g_img_align -= (i->alloc + 65535ull) & ~65535ull; }    }
     memset(i, 0, sizeof *i);
 }
 
@@ -5327,7 +5707,7 @@ int nvmtl_vk_image_reback(nvk_image *i, int to_sysmem, int a8)
     g_alloc_bytes += mr.size;
     if (to_sysmem) { g_sys_bytes += mr.size; g_sys_align += aligned; g_res1_off++; g_res1_off_b += i->alloc; }
     else { g_vram_bytes += mr.size; g_img_align += aligned; nvmtl_vk_budget_charge(mr.size); g_res1_on++; g_res1_on_b += mr.size; }
-    i->img = img; i->mem = mem; i->view = view; i->alloc = mr.size; i->sysmem = to_sysmem ? 1 : 0; i->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    i->img = img; i->mem = mem; i->view = view; i->alloc = mr.size; i->sysmem = to_sysmem ? 1 : 0; i->layout = VK_IMAGE_LAYOUT_UNDEFINED; i->imt = 0;
     return 0;
 }
 
@@ -5426,7 +5806,7 @@ int nvmtl_vk_image_migrate(nvk_image *i, int to_sysmem, int a8, nvk_image *old_o
       g_alloc_bytes += mr.size;
       if (to_sysmem) { g_sys_bytes += mr.size; g_sys_align += aligned; g_res2_off++; g_res2_off_b += i->alloc; }
       else { g_vram_bytes += mr.size; g_img_align += aligned; nvmtl_vk_budget_charge(mr.size); g_res2_on++; g_res2_on_b += mr.size; } }
-    i->img = img; i->mem = mem; i->view = view; i->alloc = mr.size; i->sysmem = to_sysmem ? 1 : 0; i->layout = (uint32_t)was;
+    i->img = img; i->mem = mem; i->view = view; i->alloc = mr.size; i->sysmem = to_sysmem ? 1 : 0; i->layout = (uint32_t)was; i->imt = 0;
     return 0;
 fail:
     if (view) pvkDestroyImageView(g_dev, view, NULL);
@@ -5727,7 +6107,7 @@ int nvmtl_vk_copy_image_to_buffer_layer(nvk_queue *q, nvk_image *img, uint32_t x
 }
 
 void nvmtl_vk_cmd_draw_indirect(nvk_cmdbuf *c, nvk_buffer *b, size_t off)
-{ if (c->nobind) return; pvkCmdDrawIndirect(c->cb, (VkBuffer)b->buf, off, 1, 0); }
+{ if (c->nobind) return; nvmtl_fetch_barrier(c); pvkCmdDrawIndirect(c->cb, (VkBuffer)b->buf, off, 1, 0); }
 int nvmtl_vk_cmd_draw_patches(nvk_cmdbuf *c, const nvk_pipeline *p, uint64_t fac, uint32_t istride, float scale, uint64_t cpx, uint64_t pix,
                               uint32_t start, uint32_t count, uint32_t instances, uint32_t baseInstance, nvk_buffer *ind, size_t indoff)
 {
@@ -5758,6 +6138,7 @@ void nvmtl_vk_cmd_draw_indexed_indirect(nvk_cmdbuf *c, nvk_buffer *idx, size_t i
     if (!nvmtl_index_range_ok(idx, idxOff)) return;
     pvkCmdBindIndexBuffer(c->cb, (VkBuffer)idx->buf, idxOff, is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
     if (c->nobind) return;
+    nvmtl_fetch_barrier(c);
     pvkCmdDrawIndexedIndirect(c->cb, (VkBuffer)b->buf, off, 1, 0);
 }
 void nvmtl_vk_cmd_dispatch_indirect(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffer *b, size_t off)
@@ -6645,6 +7026,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
             | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (render ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
         VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_PREINITIALIZED };
+    ici.usage = nvmtl_fetch_usage(ici.imageType, ici.samples, ici.usage);   /* b99: IOSurface render targets read by [[color(n)]] */
     uint32_t vp = a8 ? 0 : nvmtl_vk_srgb_pair(vkfmt);
     VkFormat vfl[2] = { (VkFormat)vkfmt, (VkFormat)vp };
     VkImageFormatListCreateInfo fl = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, ici.pNext, 2, vfl };
@@ -6664,7 +7046,13 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         else { nvlog("buffer texture: VkFormat %u stays single-format - its sRGB/linear view format %u is refused (linear features 0x%x, VkResult %d%s)",
                      vkfmt, vp, (unsigned)pp.linearTilingFeatures, (int)qr, gif ? "" : ", no vkGetPhysicalDeviceImageFormatProperties2"); vp = 0; }
     }
-    VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(buffer texture)");
+    {   VkResult cr = nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img);
+        if (cr != VK_SUCCESS && (ici.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) {
+            static int said; if (said++ < 4) nvlog("buffer texture: VkFormat %u refused as an input attachment too (%d) - made without (no framebuffer fetch on it)", vkfmt, (int)cr);
+            ici.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+            cr = nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img);
+        }
+        VKCK(cr, "vkCreateImage(buffer texture)"); }
     out->layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
     out->vkflags = (uint32_t)ici.flags; out->usage = (uint32_t)ici.usage; out->vpair = vp;
     if (!g_linmod) {
@@ -6679,7 +7067,9 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, (VkImage)out->img, &mr);
     uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
     size_t at = b->moff + offset;
-    const char *why = (mr.memoryTypeBits & all) != all ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
+    /* 10-18 zero-copy: an image over imported host memory only has to accept the one memory type that memory has */
+    uint32_t need = (b->imported && g_host_mtype >= 0) ? (1u << g_host_mtype) : all;
+    const char *why = (mr.memoryTypeBits & need) != need ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
     if (why) {
         nvlog("buffer texture: refused on %s - image types 0x%x of 0x%x, bind at %zu (buffer %zu + %zu) vs alignment %llu",
               why, mr.memoryTypeBits, all, at, b->moff, offset, (unsigned long long)mr.alignment);
@@ -6945,6 +7335,7 @@ static int nvmtl_vk_image_size_align_uncached(uint32_t w, uint32_t h, uint32_t v
                             VK_IMAGE_USAGE_SAMPLED_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0)),
         VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
     VkImage im = VK_NULL_HANDLE;
+    if (!depth_attachment) ici.usage = nvmtl_fetch_usage(ici.imageType, ici.samples, ici.usage);   /* b99: as nvmtl_vk_image_mutable */
     if (!depth_attachment) ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     if (!depth_attachment && nvmtl_vk_cube_compat(mtl_type, w, h, layers))
         ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;

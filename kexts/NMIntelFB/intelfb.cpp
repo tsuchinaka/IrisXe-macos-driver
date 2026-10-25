@@ -13,6 +13,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <IOKit/graphics/IODisplay.h>
+#include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -22,6 +24,52 @@
 #include <sys/sysctl.h>
 
 #define IFBLOG(fmt, ...) IOLog("NMIntelFB: " fmt "\n", ##__VA_ARGS__)
+#include <IOKit/IONVRAM.h>
+
+/*
+ * ifb_step(): breadcrumb that survives a forced power-off. Stored in NVRAM as nmintelfb-step; read it after the next
+ * boot with:  nvram nmintelfb-step
+ */
+static void ifb_step_key(const char *key, const char *what);
+static void ifb_step(const char *what) { ifb_step_key("nmintelfb-step", what); }
+/* brightness steps: their own NVRAM entry, so a later boot with -nmintelfbnobl does not overwrite them */
+static void bl_step(const char *what) { ifb_step_key("nmintelfb-bl-step", what); }
+static void ifb_step_key(const char *key, const char *what)
+{
+    IFBLOG("step: %s", what);
+    IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
+    IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e);
+    if (n == nullptr) { if (e) e->release(); return; }
+    const OSSymbol *k = OSSymbol::withCString(key);
+    OSData *d = OSData::withBytes(what, (unsigned)strlen(what));
+    if (k && d) n->setProperty(k, d);
+    if (d) d->release();
+    if (k) k->release();
+    n->sync();
+    n->release();
+}
+
+/*
+ * The IOFBDependentID/Index pair makes this panel head 4 of the NVIDIA accelerator's display group. On a laptop with no
+ * NVIDIA card (no NVRM service) nothing ever answers for that group and WindowServer waits for it: the desktop never
+ * came up on the Xiaomi Mi Notebook Pro (Tiger Lake, Sonoma, 10-14). Set the pair only when NVRM is present, or when
+ * boot-arg nmintelfbdep=1 forces it (nmintelfbdep=0 forces it off).
+ */
+static bool ifb_join_nvidia_group()
+{
+    int force = -1;
+    if (PE_parse_boot_argn("nmintelfbdep", &force, sizeof(force)) && (force == 0 || force == 1))
+        return force == 1;
+    bool found = false;
+    if (OSDictionary *m = IOService::serviceMatching("NVRM")) {
+        if (OSIterator *it = IOService::getMatchingServices(m)) {
+            found = it->getNextObject() != nullptr;
+            it->release();
+        }
+        m->release();
+    }
+    return found;
+}
 
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
 #include <mach/kmod.h>
@@ -74,6 +122,128 @@ constexpr uint32_t fmtOf(uint32_t ctl)  { return (ctl >> 23) & 0x1F; }
 constexpr uint32_t tileOf(uint32_t ctl) { return (ctl >> 10) & 0x7; }
 }
 
+// Panel brightness (same scheme as NVRMFB's NVRMBacklightHandler). macOS gives the brightness keys and slider to an
+// AppleBacklightDisplay, which IOGraphics creates for a built-in LCD connection when a service named "backlight"
+// exists below the framebuffer before it is opened. This handler is that service: IODisplay offers "brightness" and
+// "linear-brightness" (0-100) through it, and each change writes the panel PWM duty cycle the firmware already set up
+// (display 11+/PCH: BLC_PWM_CTL 0xC8250 enable bit 31, BLC_PWM_FREQ 0xC8254, BLC_PWM_DUTY 0xC8258). The register write
+// runs from a thread call, because IODisplay calls doIntegerSet() with the framebuffer lock held.
+static const uint32_t kBlcCtl = 0xC8250, kBlcFreq = 0xC8254, kBlcDuty = 0xC8258;
+static const SInt32 kMinBacklight = 5;   // never 0: some panels switch the backlight off completely
+
+class NMIntelBacklight : public IODisplayParameterHandler {
+    OSDeclareDefaultStructors(NMIntelBacklight)
+    volatile uint8_t *fRegs = nullptr;
+    uint32_t fFreq = 0;
+    thread_call_t fApply = nullptr;
+    volatile SInt32 fPending = -1;
+    SInt32 fLevel = 100;
+    thread_call_t fSave = nullptr;
+    volatile bool fPowered = true;
+    uint32_t dutyFor(SInt32 v) const {
+        SInt32 pct = v < kMinBacklight ? kMinBacklight : (v > 100 ? 100 : v);
+        return (uint32_t)(((uint64_t)fFreq * (uint64_t)pct) / 100);
+    }
+    // brightness survives a restart: kept in NVRAM as nmintelfb-brightness (one byte, 0-100), written 2 s after the last change
+    static void saveFire(thread_call_param_t p, thread_call_param_t) {
+        NMIntelBacklight *me = (NMIntelBacklight *)p;
+        IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
+        IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e);
+        if (n == nullptr) { if (e) e->release(); return; }
+        uint8_t b = (uint8_t)(me->fLevel < 0 ? 0 : (me->fLevel > 100 ? 100 : me->fLevel));
+        const OSSymbol *k = OSSymbol::withCString("nmintelfb-brightness");
+        OSData *d = OSData::withBytes(&b, 1);
+        if (k && d) n->setProperty(k, d);
+        if (d) d->release();
+        if (k) k->release();
+        n->sync();
+        n->release();
+    }
+public:
+    static SInt32 savedLevel() {
+        SInt32 v = -1;
+        IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
+        if (IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e)) {
+            if (OSData *d = OSDynamicCast(OSData, n->getProperty("nmintelfb-brightness")))
+                if (d->getLength() == 1) v = *(const uint8_t *)d->getBytesNoCopy();
+        }
+        if (e) e->release();
+        return (v >= kMinBacklight && v <= 100) ? v : -1;
+    }
+    // display/system sleep: backlight off; wake: the PWM set up again (sleep can reset it) at the current level
+    void setPowered(bool on) {
+        if (!fRegs || on == fPowered) return;
+        fPowered = on;
+        if (on) {
+            *(volatile uint32_t *)(fRegs + kBlcFreq) = fFreq;
+            *(volatile uint32_t *)(fRegs + kBlcDuty) = dutyFor(fLevel);
+            uint32_t ctl = *(volatile uint32_t *)(fRegs + kBlcCtl);
+            if (!(ctl & (1u << 31))) *(volatile uint32_t *)(fRegs + kBlcCtl) = ctl | (1u << 31);
+            IFBLOG("backlight: on at %d%%", (int)fLevel);
+        } else {
+            *(volatile uint32_t *)(fRegs + kBlcDuty) = 0;
+            IFBLOG("backlight: off (sleep)");
+        }
+    }
+    void applyNow(SInt32 v) { if (fRegs && fPowered) *(volatile uint32_t *)(fRegs + kBlcDuty) = dutyFor(v); }
+private:
+    static void applyFire(thread_call_param_t p, thread_call_param_t) {
+        NMIntelBacklight *me = (NMIntelBacklight *)p;
+        SInt32 v;
+        do { v = me->fPending; } while (!OSCompareAndSwap((UInt32)v, (UInt32)-1, (volatile UInt32 *)&me->fPending));
+        if (v < 0 || !me->fRegs) return;
+        uint32_t duty = me->dutyFor(v);
+        me->fLevel = v;
+        if (me->fPowered) *(volatile uint32_t *)(me->fRegs + kBlcDuty) = duty;
+        IFBLOG("backlight: %d%% (duty %u of %u)%s", (int)v, duty, me->fFreq, me->fPowered ? "" : " (kept for wake)");
+        if (me->fSave) { uint64_t d; clock_interval_to_deadline(2000, kMillisecondScale, &d); thread_call_enter_delayed(me->fSave, d); }
+        static int applied;
+        if (applied < 3) { applied++; bl_step("backlight: level applied"); }   /* first few only: spare the NVRAM */
+    }
+public:
+    static NMIntelBacklight *with(volatile uint8_t *regs, uint32_t freq, SInt32 level) {
+        NMIntelBacklight *h = OSTypeAlloc(NMIntelBacklight);
+        if (!h || !h->init()) { OSSafeReleaseNULL(h); return nullptr; }
+        h->fRegs = regs; h->fFreq = freq; h->fLevel = level < 0 ? 0 : (level > 100 ? 100 : level);
+        h->fApply = thread_call_allocate(applyFire, h);
+        h->fSave = thread_call_allocate(saveFire, h);
+        if (!h->fApply) { h->release(); return nullptr; }
+        return h;
+    }
+    void detachRegs() { fRegs = nullptr; }
+    bool setDisplay(IODisplay *display) override {
+        if (!display) return false;
+        OSObject *old = display->copyProperty(gIODisplayParametersKey);
+        OSDictionary *cur = OSDynamicCast(OSDictionary, old);
+        OSDictionary *params = cur ? OSDictionary::withDictionary(cur) : OSDictionary::withCapacity(2);
+        OSSafeReleaseNULL(old);
+        if (!params) return false;
+        IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, 100);
+        IODisplay::setParameter(params, gIODisplayBrightnessKey, fLevel);
+        IODisplay::addParameter(params, gIODisplayLinearBrightnessKey, 0, 100);
+        IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, fLevel);
+        display->setProperty(gIODisplayParametersKey, params);
+        params->release();
+        IFBLOG("backlight: brightness offered on %s, panel at %d%%", display->getName(), (int)fLevel);
+        bl_step("backlight: brightness offered to macOS");
+        return true;
+    }
+    bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
+        if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey) return false;
+        fPending = value > 100 ? 100 : (SInt32)value;
+        thread_call_enter(fApply);
+        return true;
+    }
+    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
+    bool doUpdate() override { return true; }
+    void free() override {
+        if (fApply) { thread_call_cancel(fApply); while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); } fApply = nullptr; }
+        if (fSave) { thread_call_cancel(fSave); while (!thread_call_free(fSave)) { thread_call_cancel(fSave); IOSleep(1); } fSave = nullptr; }
+        IODisplayParameterHandler::free();
+    }
+};
+OSDefineMetaClassAndStructors(NMIntelBacklight, IODisplayParameterHandler)
+
 class NMIntelFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMIntelFB)
     IOPCIDevice *fPCI = nullptr;
@@ -87,6 +257,16 @@ class NMIntelFB : public IOFramebuffer {
     thread_call_t fVblTimer = nullptr;
     uint64_t fVblNext = 0, fVblCalls = 0;
     volatile bool fStopping = false;
+    NMIntelBacklight *fBacklight = nullptr;
+    void publishBacklight();
+    thread_call_t fPmCall = nullptr;
+    static void pmRegister(thread_call_param_t p0, thread_call_param_t) {
+        NMIntelFB *me = (NMIntelFB *)p0;
+        if (me->fStopping) return;
+        ifb_step("power: registering (deferred)");
+        IOReturn r = me->registerPowerDriver(me, kPowerStates, 2);
+        ifb_step(r == kIOReturnSuccess ? "power: registered" : "power: registration FAILED");
+    }
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         NMIntelFB *me = (NMIntelFB *)p0;
         if (me->fStopping) return;
@@ -187,12 +367,18 @@ public:
     // NVRMFB acknowledges at once and answers the power attributes itself. Studio 10-10: with NMIntelFB under NVRM the
     // first WindowServer restart froze every display.
     IOReturn setPowerState(unsigned long ordinal, IOService *) override {
+        ifb_step(ordinal ? "setPowerState on" : "setPowerState off");
+        dumpDisplay(ordinal ? "power on" : "power off");
+        if (fBacklight && !ordinal) fBacklight->setPowered(false);
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        if (fBacklight && ordinal) fBacklight->setPowered(true);
+        ifb_step("setPowerState done");
         return kIOPMAckImplied;
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
         if (attribute == kIOPowerAttribute) {
+            if (fBacklight) fBacklight->setPowered(value != 0);   // display sleep / wake
             if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
                          return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
             handleEvent(kIOFBNotifyWillPowerOff);
@@ -209,6 +395,26 @@ public:
             return kIOReturnSuccess;
         default: return IOFramebuffer::setAttributeForConnection(idx, attribute, value);
         }
+    }
+    // sleep/wake diagnosis: what the display engine looks like going into sleep and coming out of it (read only)
+    void dumpDisplay(const char *when) {
+        if (!fRegs) return;
+        static const struct { const char *n; uint32_t o; } r[] = {
+            { "PP_STATUS", 0xC7200 }, { "PP_CONTROL", 0xC7204 }, { "TRANSCONF_A", 0x70008 }, { "PLANE_CTL_1_A", 0x70180 },
+            { "PLANE_SURF_1_A", 0x7019C }, { "PIPE_SRC_A", 0x6001C }, { "DDI_BUF_CTL_A", 0x64000 },
+            { "TRANS_DDI_FUNC_CTL_A", 0x60400 }, { "DPLL0_ENABLE", 0x46010 }, { "PWR_WELL_CTL2", 0x45404 },
+            { "DC_STATE_EN", 0x45504 }, { "BLC_PWM_CTL", 0xC8250 }, { "BLC_PWM_FREQ", 0xC8254 }, { "BLC_PWM_DUTY", 0xC8258 },
+        };
+        for (auto &e : r) IFBLOG("regs[%s] %s=0x%08x", when, e.n, rd(e.o));
+    }
+    // AppleBacklightDisplay::probe takes only an LCD connection; answer as NVRMFB does when the backlight is ours
+    IOReturn getAppleSense(IOIndex connectIndex, UInt32 *senseType, UInt32 *primary, UInt32 *extended, UInt32 *displayType) override {
+        if (connectIndex != 0 || !fBacklight) return kIOReturnUnsupported;
+        if (senseType) *senseType = 0;
+        if (primary) *primary = 0;
+        if (extended) *extended = 0;
+        if (displayType) *displayType = kGenericLCD;
+        return kIOReturnSuccess;
     }
     IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
         if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
@@ -250,6 +456,7 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
     fVer = displayVersion(dev);
     if (!fVer) return nullptr;   // an Intel GPU this driver does not know (older ones have Apple's own driver)
     IFBLOG("8086:%04x display version %u", dev, fVer);
+    ifb_step("probe: Intel display matched");
     return IOFramebuffer::probe(provider, score);
 }
 
@@ -330,24 +537,71 @@ bool NMIntelFB::start(IOService *provider)
     if (!fMMIO || !ap) { IFBLOG("BAR0 or BAR2 is not mapped - leaving the firmware screen"); OSSafeReleaseNULL(fMMIO); return false; }
     fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
     fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
-    if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
-    if (!IOFramebuffer::start(provider)) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    if (!adoptFirmwareMode()) { ifb_step("start: firmware mode not usable, declined"); OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    publishBacklight();   // before IOFramebuffer::start(): IOFramebuffer::open looks for "backlight"
+    ifb_step("start: firmware mode adopted, IOFramebuffer::start");
+    if (!IOFramebuffer::start(provider)) { ifb_step("start: IOFramebuffer::start FAILED"); OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    ifb_step("start: IOFramebuffer::start returned");
     // Head 4 of the NVIDIA accelerator (NVAccel): WindowServer composites this panel on the NVIDIA card and the
-    // display pipe copies each frame into fSurfMap. Without NVAccel the panel stays a plain framebuffer.
-    if (IODeviceMemory *sm = IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * fHeight)) {
-        fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
+    // display pipe copies each frame into fSurfMap. Without NVIDIA the second (write-combined) mapping of the scan-out
+    // is not needed, and on the Xiaomi Tiger Lake laptop the boot froze right here (10-15): skip it.
+    ifb_step("start: looking for an NVIDIA driver");
+    bool joinNv = ifb_join_nvidia_group();
+    ifb_step(joinNv ? "start: NVIDIA driver found" : "start: no NVIDIA driver");
+    if (joinNv) {
+        ifb_step("start: mapping the scan-out write-combined");
+        if (IODeviceMemory *sm = IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * fHeight)) {
+            fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
+        }
+        ifb_step("start: scan-out mapped");
     }
-    if (fSurfMap) {
+    if (fSurfMap && joinNv) {
         setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
         setProperty("IOFBDependentIndex", 4ull, 32);
-    } else IFBLOG("the surface would not map write-combined: NVIDIA rendering stays off for this panel");
+        IFBLOG("joined the NVIDIA display group (head 4)");
+    } else if (joinNv) IFBLOG("the surface would not map write-combined: NVIDIA rendering stays off for this panel");
+    else IFBLOG("no NVIDIA card: standalone panel (no IOFBDependentID, no second mapping)");
     setProperty("NMIntelFBPipe", fPipe, 32);
     setProperty("NMIntelFBDisplayVersion", fVer, 32);
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
+    ifb_step("start: arming the 60 Hz vblank timer");
     armVbl();
-    registerPowerDriver(this, kPowerStates, 2);
+    // registerPowerDriver() inside start() never returned on the Xiaomi Tiger Lake laptop (Sequoia, 10-15): the start
+    // never finished, so IOGraphics never resumed the console or handed the panel to WindowServer. Register from a
+    // thread call 2 s after start returns instead; boot-arg -nmintelfbnopm skips the registration altogether.
+    if (PE_parse_boot_argn("-nmintelfbnopm", nullptr, 0)) {
+        ifb_step("start: power registration skipped (-nmintelfbnopm)");
+    } else if ((fPmCall = thread_call_allocate(pmRegister, this)) != nullptr) {
+        uint64_t d; clock_interval_to_deadline(2000, kMillisecondScale, &d);
+        thread_call_enter_delayed(fPmCall, d);
+    } else {
+        ifb_step("start: no thread call for power registration, skipped");
+    }
     IFBLOG("built-in panel published (%ux%u)", fWidth, fHeight);
+    ifb_step(joinNv ? "start: published (NVIDIA group)" : "start: published (standalone)");
     return true;
+}
+
+void NMIntelFB::publishBacklight()
+{
+    if (PE_parse_boot_argn("-nmintelfbnobl", nullptr, 0)) { IFBLOG("backlight: off by boot-arg"); return; }
+    uint32_t ctl = rd(kBlcCtl), freq = rd(kBlcFreq), duty = rd(kBlcDuty);
+    IFBLOG("backlight: BLC_PWM_CTL 0x%08x FREQ 0x%08x DUTY 0x%08x", ctl, freq, duty);
+    if (!(ctl & kEnable) || freq == 0 || duty > freq) {
+        bl_step("backlight: PWM not enabled by the firmware, no brightness control");
+        return;
+    }
+    SInt32 level = (SInt32)(((uint64_t)duty * 100 + freq / 2) / freq);
+    SInt32 saved = NMIntelBacklight::savedLevel();
+    if (saved >= 0) { IFBLOG("backlight: restoring saved brightness %d%% (firmware left %d%%)", (int)saved, (int)level); level = saved; }
+    fBacklight = NMIntelBacklight::with(fRegs, freq, level);
+    if (!fBacklight) { bl_step("backlight: handler allocation failed"); return; }
+    if (saved >= 0) fBacklight->applyNow(saved);
+    fBacklight->setName("backlight");
+    if (!fBacklight->attach(this)) { OSSafeReleaseNULL(fBacklight); bl_step("backlight: attach failed"); return; }
+    bl_step("backlight: registering the handler (async)");
+    fBacklight->registerService();
+    bl_step("backlight: handler published");
 }
 
 void NMIntelFB::stop(IOService *provider)
@@ -357,6 +611,8 @@ void NMIntelFB::stop(IOService *provider)
     if (gVirt == this) { sysctl_unregister_oid(&sysctl__debug_nmintelfb_sample); gVirt = nullptr; }
 #endif
     // thread_call_cancel_wait is not exported to kexts: cancel and retry the free until the callback is out (as NVRMFB)
+    if (fBacklight) { fBacklight->detachRegs(); fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
+    if (fPmCall) { thread_call_cancel(fPmCall); while (!thread_call_free(fPmCall)) { thread_call_cancel(fPmCall); IOSleep(5); } fPmCall = nullptr; }
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
     OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
     IOFramebuffer::stop(provider);

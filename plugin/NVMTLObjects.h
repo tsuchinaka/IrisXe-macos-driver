@@ -44,7 +44,9 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _viewType, _viewSlices, _relativeLevel, _relativeSlice;
   uint32_t _baseSlice, _baseLevel;
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
+  BOOL _surfVerify;   /* b129: upload once more at the next use - the last upload may have caught a write in progress */
   nvk_buffer _vramBuf; BOOL _vramOn;
+  nvk_buffer _hostBuf; BOOL _hostOn;   /* zero-copy: the image lives in the IOSurface's own pages (10-18) */
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;
@@ -117,6 +119,8 @@ extern id gNVMTLMainDevice;
   NSMutableArray *_scratch;
   NSMutableSet *_resources;
   NSMutableSet *_surfDirty;
+  BOOL _wroteSurface;   /* any IOSurface written: waitUntilScheduled waits for the pixels (10-18, Brave) */
+  BOOL _surfCounted;    /* counted in nvmtl_surf_writers until its execution finishes */
   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
   unsigned _nEncSealed;

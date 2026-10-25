@@ -671,8 +671,30 @@ pub(in crate::passes) fn rewrite_return(
         }
     }
 
+    // b154: `defs` is the type table captured by build_stage_input. A pass between that and here
+    // (materialize_inlined_local_pointer_field_stores) can give the entry a NEW return struct type
+    // (Dawn/Tint vertex entries that fill their return value through a non-inlined helper: Brave's
+    // Graphite CoverBounds step). The new id was missing from `defs`, `rdef` came back None, and the
+    // vertex shader was emitted with NO outputs at all - no position, nothing drawn (10-23: Brave white
+    // bars, stale text, missing icons). Types defined since then are now looked up in the module.
+    let mut refreshed_defs: Option<HashMap<Word, Instruction>> = None;
+    if !defs.contains_key(&ret_ty) {
+        let mut merged = defs.clone();
+        for inst in &ctx.module.types_global_values {
+            if let Some(id) = inst.result_id {
+                merged.entry(id).or_insert_with(|| inst.clone());
+            }
+        }
+        refreshed_defs = Some(merged);
+    }
+    let defs: &HashMap<Word, Instruction> = refreshed_defs.as_ref().unwrap_or(defs);
     let mut outputs: Vec<OutputWrite> = vec![];
     let rdef = defs.get(&ret_ty).cloned();
+    if rdef.is_none() && matches!(stage, Stage::Vertex | Stage::Fragment) {
+        return Err(format!(
+            "entry return type %{ret_ty} has no definition; emitting the module would silently drop every stage output"
+        ));
+    }
 
     let unmodelled = match stage {
         Stage::Fragment => frag.map(|meta| meta.unmodelled_output_members.as_slice()),

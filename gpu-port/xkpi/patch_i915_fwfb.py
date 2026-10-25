@@ -18,15 +18,49 @@ if s.count(anchor) != 1:
     print("ERROR: anchor not found exactly once in", p); sys.exit(1)
 add = anchor + '''\t/* NMX_FWFB: GGTT [0, 32 MiB) still maps the firmware framebuffer; nothing may be bound there */
 \t{
-\t\tstatic struct drm_mm_node nmx_fwfb_node;
-
 \t\tmemset(&nmx_fwfb_node, 0, sizeof(nmx_fwfb_node));
 \t\tnmx_fwfb_node.start = 0;
 \t\tnmx_fwfb_node.size = min_t(u64, 32ull << 20, ggtt->vm.total / 4);
 \t\tnmx_fwfb_node.color = I915_COLOR_UNEVICTABLE;
+\t\tnmx_fwfb_size = nmx_fwfb_node.size;
 \t\tif (drm_mm_reserve_node(&ggtt->vm.mm, &nmx_fwfb_node))
 \t\t\tdrm_dbg(&ggtt->vm.i915->drm, "NMX: could not reserve the firmware framebuffer range\\n");
 \t}
 '''
-p.write_text(s.replace(anchor, add, 1))
+s = s.replace(anchor, add, 1)
+# 10-18: the node is file-scope so the initial-plane takeover (patch_i915_initial_fb.py) can hand the range to i915's own
+# object for the firmware framebuffer, and put the reservation back if that takeover fails
+_k = s.rindex("\n}\n", 0, s.index("NMX_FWFB")) + 3   # file scope, just before the function that reserves
+s = s[:_k] + "\n/* NMX_FWFB */\nstruct drm_mm_node nmx_fwfb_node;\nstatic u64 nmx_fwfb_size;\n" + s[_k:]
+s += """
+void nmx_fwfb_ggtt_release(struct i915_ggtt *ggtt);
+void nmx_fwfb_ggtt_rereserve(struct i915_ggtt *ggtt);
+
+/* NMX_FWFB: let the initial-plane takeover bind i915's object for the firmware framebuffer at GGTT 0 */
+void nmx_fwfb_ggtt_release(struct i915_ggtt *ggtt)
+{
+	mutex_lock(&ggtt->vm.mutex);
+	if (drm_mm_node_allocated(&nmx_fwfb_node))
+		drm_mm_remove_node(&nmx_fwfb_node);
+	mutex_unlock(&ggtt->vm.mutex);
+}
+
+/* NMX_FWFB: the takeover failed - protect the range again (macOS keeps drawing its console there) */
+void nmx_fwfb_ggtt_rereserve(struct i915_ggtt *ggtt)
+{
+	int err = 0;
+
+	mutex_lock(&ggtt->vm.mutex);
+	if (!drm_mm_node_allocated(&nmx_fwfb_node) && nmx_fwfb_size) {
+		memset(&nmx_fwfb_node, 0, sizeof(nmx_fwfb_node));
+		nmx_fwfb_node.start = 0;
+		nmx_fwfb_node.size = nmx_fwfb_size;
+		nmx_fwfb_node.color = I915_COLOR_UNEVICTABLE;
+		err = drm_mm_reserve_node(&ggtt->vm.mm, &nmx_fwfb_node);
+	}
+	mutex_unlock(&ggtt->vm.mutex);
+	printk("NullMoth fwfb: GGTT range reserved again (%d)\\n", err);
+}
+"""
+p.write_text(s)
 print("patched", p)

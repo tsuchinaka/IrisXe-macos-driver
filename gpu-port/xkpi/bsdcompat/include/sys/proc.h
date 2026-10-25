@@ -31,6 +31,7 @@ struct thread {
     u_char td_base_pri;
     int td_pinned;
     int td_critnest;
+    int td_crit_saved;              /* interrupt state at the outermost critical_enter of THIS thread */
     int td_intr_nesting_level;      /* refreshed from ml_at_interrupt_context() by curthread */
     int td_flags;
     int td_owepreempt;              /* FreeBSD's deferred-preemption flag; xnu preempts on its own, so always 0 */

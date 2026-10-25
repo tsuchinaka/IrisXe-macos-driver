@@ -36,11 +36,41 @@ if [ -n "$GS" ]; then
 else
     echo "ERROR: gem/i915_gem_stolen.c not found"; exit 1
 fi
+GM=$(find "$K/drm-kmod" -path '*i915/gem/i915_gem_object.c' | head -1)
+if [ -n "$GM" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_vmap.py "$GM" || { echo "ERROR: GEM vmap patch failed"; exit 1; }
+else
+    echo "ERROR: gem/i915_gem_object.c not found"; exit 1
+fi
 GV=$(find "$K/drm-kmod" -path '*i915/display/intel_display_driver.c' | head -1)
 if [ -n "$GV" ]; then
     ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_novga.py "$GV" || { echo "ERROR: VGA knob patch failed"; exit 1; }
 else
     echo "ERROR: display/intel_display_driver.c not found"; exit 1
+fi
+GD=$(find "$K/drm-kmod" -path '*i915/display/intel_display.c' | head -1)
+if [ -n "$GD" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_committrace.py "$GD" || { echo "ERROR: commit trace patch failed"; exit 1; }
+else
+    echo "ERROR: display/intel_display.c not found"; exit 1
+fi
+GI=$(find "$K/drm-kmod" -path '*i915/display/intel_plane_initial.c' | head -1)
+if [ -n "$GI" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_initial_fb.py "$GI" || { echo "ERROR: initial framebuffer patch failed"; exit 1; }
+else
+    echo "ERROR: display/intel_plane_initial.c not found"; exit 1
+fi
+GP=$(find "$K/drm-kmod" -path '*i915/display/intel_display_power.c' | head -1)
+if [ -n "$GP" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_display_rpm.py "$GP" || { echo "ERROR: display runtime-PM patch failed"; exit 1; }
+else
+    echo "ERROR: display/intel_display_power.c not found"; exit 1
+fi
+GU=$(find "$K/drm-kmod" -path '*i915/gem/i915_gem_userptr.c' | head -1)
+if [ -n "$GU" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_userptr.py "$GU" || { echo "ERROR: userptr patch failed"; exit 1; }
+else
+    echo "ERROR: gem/i915_gem_userptr.c not found"; exit 1
 fi
 ${NMX_PY:-/opt/homebrew/bin/python3} srclist.py "$K/drm-kmod" amd.flags i915 2>/dev/null > srcs-i915.all
 : > srcs-i915.txt

@@ -1,0 +1,83 @@
+name: Mesa ANV (Intel Vulkan) + Metal plugin build for macOS
+
+# Manual only. Builds libdrm + Mesa's Intel Vulkan driver (ANV) with gpu-port/patches for x86_64 macOS, plus vkfill
+# (a Vulkan compute test) and nmxmmap.dylib. Download the "nmx-vulkan" artifact and run nmx-vulkan/run-vk.sh.
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: Mesa commit
+        default: bffd919
+      libdrm_ref:
+        description: libdrm commit
+        default: b97cbde
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        timeout-minutes: 25
+        env:
+          # no "brew update" and no upgrades: on the Intel runner Homebrew then compiled LLVM from source for hours (10-16)
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_UPGRADE: "1"
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+        run: |
+          for p in meson ninja pkgconf bison flex glslang vulkan-headers vulkan-loader; do
+            echo "::group::brew install $p"
+            brew install $p || echo "brew: $p not installed"
+            echo "::endgroup::"
+          done
+          python3 -m pip install --break-system-packages mako pyyaml packaging ply >/dev/null 2>&1 || python3 -m pip install mako pyyaml packaging ply
+          uname -m; clang --version | head -1
+      - name: LLVM for Mesa's shader compiler (conda-forge, prebuilt)
+        timeout-minutes: 20
+        run: |
+          # micromamba by hand (the setup-micromamba action failed on this runner, 10-16); versions left to the solver so
+          # LLVM, Clang, libclc and the SPIR-V translator come out matching
+          mkdir -p "$RUNNER_TEMP/mm" && cd "$RUNNER_TEMP/mm"
+          curl -fsSL https://micro.mamba.pm/api/micromamba/osx-64/latest | tar -xj bin/micromamba
+          export MAMBA_ROOT_PREFIX="$RUNNER_TEMP/mm/root"
+          E="$RUNNER_TEMP/mesa-llvm"
+          # the SPIR-V translator's conda-forge name is not certain (spirv-llvm-translator did not exist, 10-16): try each
+          ok=0
+          for tr in libllvmspirv llvm-spirv spirv-llvm-translator ""; do
+            for clc in libclc ""; do
+              echo "::group::try: llvmdev clangdev $tr $clc"
+              if ./bin/micromamba create -y -p "$E" -c conda-forge llvmdev clangdev spirv-tools $tr $clc; then ok=1; echo "::endgroup::"; break 2; fi
+              echo "::endgroup::"
+            done
+          done
+          [ $ok = 1 ] || exit 1
+          ./bin/micromamba list -p "$E" | grep -iE "llvm|clang|spirv|clc"
+          "$E/bin/llvm-config" --version
+          ls "$E/lib/pkgconfig" "$E/share/pkgconfig" 2>/dev/null
+          echo "MESA_LLVM_PREFIX=$E" >> "$GITHUB_ENV"
+      - name: Build
+        timeout-minutes: 120
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+          LIBDRM_REF: ${{ inputs.libdrm_ref }}
+          NMX_MIN_OS: "14.0"
+        run: bash tools/vk/build-anv.sh "$RUNNER_TEMP/vk"
+      - name: Metal plugin (translator + NVMTLDriver.bundle + mtlprobe)
+        timeout-minutes: 60
+        env:
+          NMX_MIN_OS: "14.0"
+        run: bash tools/metal/build-metal.sh "$RUNNER_TEMP/vk"
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nmx-vulkan-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/vk/out
+            ${{ runner.temp }}/vk/logs
+          if-no-files-found: warn

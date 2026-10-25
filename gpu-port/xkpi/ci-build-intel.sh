@@ -32,7 +32,15 @@ group() { [ -n "${GITHUB_ACTIONS:-}" ] && echo "::group::$1"; return 0; }
 endgroup() { [ -n "${GITHUB_ACTIONS:-}" ] && echo "::endgroup::"; return 0; }
 
 # fetch <url> <ref> <dir> [sparse path...]: shallow fetch of one ref (branch, tag or commit); sparse paths limit the checkout
+# b85: a GitHub network hiccup left drm-kmod unfetched on one runner (10-19, "MISSING drm-kmod/i915/Makefile") - 3 tries
 fetch() {
+    for attempt in 1 2 3; do
+        fetch_once "$@" && return 0
+        echo "fetch $1 failed (attempt $attempt) - retrying in 20 s" >&2; sleep 20
+    done
+    return 1
+}
+fetch_once() {
     url=$1; ref=$2; dir=$3; shift 3
     rm -rf "$dir"; mkdir -p "$dir"
     ( cd "$dir" && git init -q && git remote add origin "$url" \
@@ -97,13 +105,92 @@ run flags "$NMX_PY" gen_flags.py "$NMX_K/drm-kmod" amd.flags
 run core ./all.sh 60
 run i915 ./all-i915.sh 60
 run runtime ./rt.sh
-run link ./kext/build.sh "$W/out"
+# b80: an IOKit-side file that does not compile must not end as a kext with missing pieces (kmutil refuses it later)
+if grep -q "^runtime rc=0$" "$CI/status.txt"; then
+    run link ./kext/build.sh "$W/out"
+else
+    say ""; say "**runtime stage failed (see ci/runtime.txt: XNU FAIL) - NMXGPU.kext NOT linked**"
+    echo "link rc=skipped" >> "$CI/status.txt"
+fi
+
+# ---- NMIntelFB.kext: small framebuffer that re-publishes the screen the firmware lit (no i915 needed) -----------------
+build_intelfb() {
+    S="$HERE/../../kexts/NMIntelFB"; O="$W/out/NMIntelFB.kext"
+    [ -f "$S/intelfb.cpp" ] || { echo "no $S/intelfb.cpp"; return 1; }
+    mkdir -p "$O/Contents/MacOS" "$W/ifb" || return 1
+    SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
+    xcrun clang++ -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$S" \
+        -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -std=c++17 -fno-rtti -fno-exceptions -fno-builtin \
+        -fno-common -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2 \
+        -c "$S/intelfb.cpp" -o "$W/ifb/intelfb.o" || return 1
+    xcrun clang++ -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -fapple-kext -nostdlib -Xlinker -kext \
+        -lkmodc++ -lkmod -lcc_kext "$W/ifb/intelfb.o" -o "$O/Contents/MacOS/NMIntelFB" || return 1
+    cp "$S/Info.plist" "$O/Contents/Info.plist"
+}
+run intelfb build_intelfb
+# ---- NVRMAGDC.kext: the AppleGraphicsDeviceControl object WindowServer's IOPresentment needs before it sends frames to
+# the display pipe (b84: it answers for NMXGPUFB when there is no NVIDIA framebuffer) --------------------------------
+build_agdc() {
+    S="$HERE/../../kexts/NVRMAGDC"; O="$W/out/NVRMAGDC.kext"
+    mkdir -p "$O/Contents/MacOS" "$W/agdc" || return 1
+    SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
+    xcrun clang++ -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$S" \
+        -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -std=c++17 -fno-rtti -fno-exceptions -fno-builtin \
+        -fno-common -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2 \
+        -c "$S/nvrm-agdc.cpp" -o "$W/agdc/agdc.o" || return 1
+    xcrun clang++ -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -fapple-kext -nostdlib -Xlinker -kext \
+        -lkmodc++ -lkmod -lcc_kext "$W/agdc/agdc.o" -o "$O/Contents/MacOS/NVRMAGDC" || return 1
+    cp "$S/Info.plist" "$O/Contents/Info.plist"
+    echo "NVRMAGDC.kext: $(stat -f %z "$O/Contents/MacOS/NVRMAGDC") bytes"
+}
+run agdc build_agdc
+# drmprobe: user-space check of the i915 render node (tools/drmprobe), the first acceleration step
+build_drmprobe() {
+    xcrun clang -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -O2 -Wall \
+        "$HERE/../../tools/drmprobe/drmprobe.c" -o "$W/out/drmprobe"
+    xcrun clang -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -O2 -Wall \
+        "$HERE/../../tools/gpuexec/gpuexec.c" -o "$W/out/gpuexec"
+    xcrun clang -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -O2 -Wall \
+        "$HERE/../../tools/gpuexec/gpustress.c" -o "$W/out/gpustress"
+}
+run drmprobe build_drmprobe
+
+# ---- NMXAccel.kext: the IOAccelerator for the GPU NMXGPU drives (kexts/NVRM/accel built with -DNMX_ACCEL) -----------
+# It shares its source with the NVIDIA accelerator, which includes NVIDIA's open-gpu-kernel-modules headers (types and
+# the nvkms kapi); the RM build's own -D list is not needed for the NMX_ACCEL paths.
+build_nmxaccel() {
+    local S="$HERE/../../kexts/NVRM" O="$W/out/NMXAccel.kext" OG="$W/ogkm"
+    if [ ! -d "$OG/src" ]; then
+        git clone -q --depth 1 --branch 610.57.04 https://github.com/NVIDIA/open-gpu-kernel-modules.git "$OG" \
+          || git clone -q --depth 1 https://github.com/NVIDIA/open-gpu-kernel-modules.git "$OG" || return 1
+    fi
+    echo "open-gpu-kernel-modules: $(git -C "$OG" describe --tags --always 2>/dev/null)"
+    local SDK KHDR NV KMS; SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
+    NV="$OG/src/nvidia"; KMS="$OG/src/nvidia-modeset"
+    local INC=( -I"$NV/arch/nvalloc/unix/include" -I"$NV/arch/nvalloc/common/inc" -I"$OG/src/common/sdk/nvidia/inc"
+      -I"$OG/src/common/sdk/nvidia/inc/hw" -I"$OG/src/common/inc" -I"$OG/src/common/shared/inc" -I"$NV/inc" -I"$NV/inc/os"
+      -I"$NV/inc/kernel" -I"$NV/kernel/inc" -I"$NV/interface" -I"$NV/inc/libraries" -I"$NV/generated"
+      -I"$KMS/os-interface/include" -I"$KMS/kapi/interface" -I"$KMS/kapi/include" -I"$OG/src/common/unix/nvidia-push/interface"
+      -I"$KMS/interface" -I"$KMS/include" -I"$OG/src/common/unix/common/inc" -I"$OG/src/common/modeset"
+      -I"$OG/src/common/unix/common/utils/interface" )
+    mkdir -p "$O/Contents/MacOS" "$W/accel"
+    xcrun clang++ -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$S" "${INC[@]}" \
+        -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -DNVCPU_X86_64=1 -DNV_UNIX=1 -DNMX_ACCEL \
+        -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -Wall -Wno-unused-parameter \
+        -Wno-inconsistent-missing-override -Wno-unused-function -O2 \
+        -I"$S/accel" -I"$S/accel/iofam" -I"$S/accel/re" -c "$S/accel/nvrm-accel.cpp" -o "$W/accel/nmx-accel.o" || return 1
+    xcrun clang++ -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod \
+        -lcc_kext "$W/accel/nmx-accel.o" -o "$O/Contents/MacOS/NMXAccel" || return 1
+    cp "$S/accel/nmx/Info.plist" "$O/Contents/Info.plist"
+    echo "NMXAccel.kext: $(stat -f %z "$O/Contents/MacOS/NMXAccel") bytes"
+}
+run nmxaccel build_nmxaccel
 
 # ---- summary -------------------------------------------------------------------------------------------------------
 say ""
 say "## Stages"
 say ""
-for st in flags core i915 runtime link; do
+for st in flags core i915 runtime link intelfb agdc drmprobe nmxaccel; do
     rc=$(sed -n "s/^$st rc=//p" "$CI/status.txt")
     line=$(grep -E "^(sources:|runtime sources:)" "$CI/$st.txt" 2>/dev/null | tail -1)
     say "- **$st**: exit $rc ${line:+- $line}"
@@ -117,7 +204,7 @@ if [ -f "$W/out/NMXGPU.kext/Contents/MacOS/NMXGPU" ]; then
 else
     say ""; say "**NMXGPU did not link.**"
 fi
-for st in core i915 runtime link; do
+for st in core i915 runtime link intelfb agdc nmxaccel; do
     if [ -s "$CI/$st.txt" ]; then
         say ""; say "### $st: last lines"; say '```'
         tail -n 45 "$CI/$st.txt" | tee -a "$SUM"

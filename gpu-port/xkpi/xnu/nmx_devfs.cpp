@@ -19,6 +19,7 @@
 #include <sys/vnode.h>
 #include <miscfs/devfs/devfs.h>
 #include <IOKit/IOLib.h>
+#include <string.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLocks.h>
 #include <libkern/OSAtomic.h>
@@ -32,6 +33,8 @@ void task_deallocate(task_t task);
 vm_map_t get_task_map(task_t task);
 kern_return_t vm_deallocate(vm_map_t target, vm_offset_t address, vm_size_t size);
 }
+
+extern "C" volatile int g_nmx_bridge_opens;   /* b80: opens made through the IOKit bridge (nmx_drm_bridge.cpp) */
 
 #define NODE_MINORS 256
 #define OPEN_MINOR_MAX 65536
@@ -82,6 +85,8 @@ static void *cookie_for_open(int m, int *node_out)
 
 /* ---- entry points ------------------------------------------------------------------------------------------------- */
 
+extern "C" void nmx_critical_syscall_check(void);
+
 static int nmx_open(dev_t dev, int flags, int devtype, struct proc *p)
 {
     int m = minor(dev);
@@ -89,6 +94,7 @@ static int nmx_open(dev_t dev, int flags, int devtype, struct proc *p)
     if (cookie == nullptr)
         return ENXIO;
     int err = nmx_cdev_open(cookie, m, flags);
+    nmx_critical_syscall_check();
     if (err) {
         IOLockLock(g_lock);
         g_open_node[m] = 0;
@@ -101,6 +107,7 @@ static int nmx_close(dev_t dev, int flags, int devtype, struct proc *p)
 {
     int m = minor(dev);
     int err = nmx_cdev_close(m, flags);
+    nmx_critical_syscall_check();
     IOLockLock(g_lock);
     if (m >= NODE_MINORS && m < OPEN_MINOR_MAX)
         g_open_node[m] = 0;
@@ -110,7 +117,9 @@ static int nmx_close(dev_t dev, int flags, int devtype, struct proc *p)
 
 static int nmx_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p)
 {
-    return nmx_cdev_ioctl(minor(dev), cmd, data, fflag);
+    int err = nmx_cdev_ioctl(minor(dev), cmd, data, fflag);
+    nmx_critical_syscall_check();   /* 10-18: never return to user space (or exit) with interrupts off */
+    return err;
 }
 
 /*
@@ -128,6 +137,7 @@ static int nmx_read(dev_t dev, struct uio *uio, int ioflag)
     user_size_t len = uio_curriovlen(uio);
     size_t done = 0;
     int err = nmx_cdev_read(minor(dev), (uint64_t)base, (size_t)len, &done, (ioflag & IO_NDELAY) ? 1 : 0);
+    nmx_critical_syscall_check();
     if (done > 0)
         uio_update(uio, (user_size_t)done);
     return err;
@@ -183,7 +193,7 @@ extern "C" int nmx_xnu_devfs_busy(void)
     for (int m = NODE_MINORS; m < OPEN_MINOR_MAX; m++)
         if (g_open_node[m]) { busy++; }
     IOLockUnlock(g_lock);
-    return busy;
+    return busy + g_nmx_bridge_opens;
 }
 
 extern "C" void nmx_xnu_devfs_fini(void)
@@ -196,10 +206,16 @@ extern "C" void nmx_xnu_devfs_fini(void)
     g_lock = nullptr;
 }
 
+/* b80: the render node's LinuxKPI cookie, for the IOKit bridge (nmx_drm_bridge.cpp): WindowServer and browser GPU
+   sandboxes may not open /dev/dri (EPERM), but may open an IOAccelerator user client, which opens the node here */
+static void *volatile g_render_cookie;
+extern "C" void *nmx_xnu_devfs_render_cookie(void) { return g_render_cookie; }
 extern "C" void *nmx_xnu_devfs_make(const char *path, uint32_t uid, uint32_t gid, int mode, void *cookie)
 {
     if (g_major < 0)
         return nullptr;
+    if (path && strnstr(path, "renderD", strlen(path) + 1) && g_render_cookie == nullptr)
+        g_render_cookie = cookie;
     IOLockLock(g_lock);
     int node = -1;
     for (int i = 0; i < NODE_MINORS; i++)

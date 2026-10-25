@@ -14,7 +14,9 @@ public:
     virtual void setSyncCommand(unsigned int*, unsigned int&, unsigned int&, _AMDSurfaceSwapSyncOptions const&) const = 0;
     virtual void didSubmitSwap(unsigned int, unsigned int);
     virtual bool isBackBufferReady(unsigned int);
-    virtual void submitCopyForward(IOAccelEvent*, unsigned int, IOAccelResource2*, IOAccelResource2*, IOAccelBounds const*, unsigned int);
+    /* b107: returns IOReturn, not void (dtrace 10-20: IOAccelLegacySurface::copy_forward returned what this returned,
+       0xe00002c7 from the family's default). The return type does not change the slot or the mangled name. */
+    virtual IOReturn submitCopyForward(IOAccelEvent*, unsigned int, IOAccelResource2*, IOAccelResource2*, IOAccelBounds const*, unsigned int);
     virtual void submitUpdate(unsigned int, IOAccelBounds*, unsigned int);
     virtual void pickPresentType(unsigned int);
     virtual void _pure335() = 0;

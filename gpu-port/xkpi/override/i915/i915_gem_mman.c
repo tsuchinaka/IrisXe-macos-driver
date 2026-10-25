@@ -221,11 +221,13 @@ static unsigned int tile_row_pages(const struct drm_i915_gem_object *obj)
  */
 int i915_gem_mmap_gtt_version(void)
 {
-#if __FreeBSD_version < 1500508 || (__FreeBSD_version >= 1600000 && __FreeBSD_version < 1600015)
-	return 3;
-#else
-	return 5;
-#endif
+	/*
+	 * macOS port: MMAP_OFFSET works here (NMX_DRM_IOCTL_MMAP maps a GEM fake offset, gpuexec 10-16), whatever
+	 * __FreeBSD_version the port's headers carry. The FreeBSD gate above it answered 3, so Mesa ANV took the legacy
+	 * I915_GEM_MMAP path, which cannot map into a process from a kext, and vkCreateDevice failed with
+	 * VK_ERROR_MEMORY_MAP_FAILED (Iris Xe 10-17). 4 = MMAP_OFFSET; 5 (partial mmaps) is not claimed.
+	 */
+	return 4;
 }
 
 static inline struct i915_gtt_view

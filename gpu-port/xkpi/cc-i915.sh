@@ -17,5 +17,5 @@ exec xcrun clang -arch x86_64 -mmacosx-version-min=${NMX_MIN_OS:-15.0} -ffile-pr
   -include $L/common/include/linux/compiler_types.h -include $L/common/include/linux/kconfig.h -include $X/bsdcompat/include/nmxkpi_post.h \
   -I$X/override/include -I$X/bsdcompat/include -I$D/linuxkpi/bsd/include -I$L/common/include -I$L/dummy/include -I$X/fbroot \
   -I$D/include -I$D/include/drm -I$D/include/uapi -I$D/drivers/gpu/drm -I$D/drivers/gpu -I$D/drivers \
-  -I$D/drivers/gpu/drm/i915 -I$D/drivers/gpu/drm/i915/display -I$D/drivers/gpu/drm/i915/gem -DI915 \
+  -I$D/drivers/gpu/drm/i915 -I$D/drivers/gpu/drm/i915/display -I$D/drivers/gpu/drm/i915/gem -DI915 -DCONFIG_MMU_NOTIFIER=1 \
   $(grep -v "KBUILD_MODNAME\|PARAM_PREFIX\|/drm/amd" $X/amd.flags | sed "s/^/ /" | tr "\n" " ") '-DKBUILD_MODNAME="i915kms"' -DLINUXKPI_PARAM_PREFIX=i915_ -DDRM_SYSCTL_PARAM_PREFIX=_i915kms -I$KF "$@" -c "$src" -o $X/obj-i915/$(basename "${src%.c}").o

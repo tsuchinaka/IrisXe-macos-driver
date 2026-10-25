@@ -12,6 +12,9 @@
 
 #define NVRM_VRAM_FN_SCANOUT  "nvScanoutInfo"
 
+/* b90: set by the framebuffer in nvAllocVram replies: handle is an IOMemoryDescriptor (system memory, maybe scattered) */
+#define NVRM_VRAM_FLAG_MD     1u
+
 #define NVRM_VRAM_BAR1_BUDGET (192ull * 1024ull * 1024ull)
 
 struct NVRMVramRequest {

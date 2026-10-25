@@ -9,6 +9,7 @@
  */
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
+#include <libkern/OSAtomic.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
 #include "nmx_xnu.h"
@@ -111,12 +112,38 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         if (task == nullptr)
             return EFAULT;
     }
+    /* 10-18 panic (IOPageableMapForAddress: address out of range): an mm recorded for a kernel thread resolved to
+       kernel_task, and a user address was wired in the kernel's map. User pages are only ever wired in a user task. */
+    if (task == kernel_task || task == nullptr)
+        return EFAULT;
     /* the device writes the pages when the mapping is writable (kIODirectionIn), and always reads them */
     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE,
                                                                   write ? kIODirectionOutIn : kIODirectionOut, task);
     if (md == nullptr)
         return ENOMEM;
-    if (md->prepare() != kIOReturnSuccess) {
+    IOReturn pr = md->prepare();
+    if (pr != kIOReturnSuccess && write) {
+        /* b96 (10-20, the login crash): WindowServer uploaded a 2560x1600 picture (the lock-screen wallpaper) from
+           memory it can only read - an image mapped read-only from a file. Mesa imports host memory as a userptr
+           without the read-only flag, so the pin asked for write access, xnu refused (EFAULT, 0 of 4000 pages),
+           the queue submit failed, Vulkan went down and WindowServer aborted ("Metal failed to build render
+           pipeline"). The GPU only reads an upload's source: wire the pages for reading instead. */
+        md->release();
+        md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE, kIODirectionOut, task);
+        if (md == nullptr)
+            return ENOMEM;
+        IOReturn pr2 = md->prepare();
+        static volatile SInt32 said;
+        if (OSIncrementAtomic(&said) < 16)
+            IOLog("NullMoth userptr: %lu pages at 0x%llx not writable (0x%x) - %s\n", (unsigned long)npages, (unsigned long long)uaddr,
+                  pr, pr2 == kIOReturnSuccess ? "pinned READ-ONLY" : "read-only pin refused too");
+        pr = pr2;
+    }
+    if (pr != kIOReturnSuccess) {
+        static volatile SInt32 said2;
+        if (OSIncrementAtomic(&said2) < 16)
+            IOLog("NullMoth userptr: %lu pages at 0x%llx would not wire (0x%x, write %d)\n", (unsigned long)npages, (unsigned long long)uaddr,
+                  pr, write);
         md->release();
         return EFAULT;
     }

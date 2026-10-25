@@ -33,6 +33,7 @@ static void nvbt(const char *tag, int *count, int max);
         { static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: NULL pointer, %lu bytes -> a zero-filled buffer of our own; its deallocator gets (NULL, %lu)", (unsigned long)a1, (unsigned long)a1); }
         return z;
     }
+    { extern void nvmtl_trace_nocopy(void *p, unsigned long n, int sm); nvmtl_trace_nocopy(a0, (unsigned long)a1, (int)sm); }
     NVMTLBuffer *b = [NVMTLBuffer new];
     b->_storage = sm;
     b->_ropt = a2 & ((MTLResourceOptions)0xF | ((MTLResourceOptions)0x3 << MTLResourceHazardTrackingModeShift));
@@ -53,7 +54,15 @@ static void nvbt(const char *tag, int *count, int max);
         b->_b = b->_shadow; memset(&b->_shadow, 0, sizeof b->_shadow);
         return b;
     }
-    if (nvmtl_vk_buffer_import_host(a0, a1, &b->_b) == 0) {
+    /* b161 test (/Library/GPUBundles/nvmtl-nohostbuf): no zero-copy import of the caller's pages - the buffer is a copy,
+       resynced at every submission. The invisible typed letters: WindowServer gets app layer contents that are NOT
+       IOSurfaces (shared-memory backing stores) through buffers like these; if the GPU reads the imported pages
+       without seeing the CPU's latest writes, the newest glyph is missing until the next update. */
+    static uint64_t nohb_chk; static int nohb_on;
+    { uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+      if (now >= nohb_chk) { nohb_chk = now + 250000000ull; int was = nohb_on; nohb_on = access("/Library/GPUBundles/nvmtl-nohostbuf", F_OK) == 0;
+          if (nohb_on != was) nvlog("b161 test nvmtl-nohostbuf: %s", nohb_on ? "ON - bytesNoCopy buffers are copies" : "off"); } }
+    if (!nohb_on && nvmtl_vk_buffer_import_host(a0, a1, &b->_b) == 0) {
         static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: IMPORTED the caller's pages (%lu bytes at %p) \u2014 zero copy", (unsigned long)a1, a0);
         return b;
     }

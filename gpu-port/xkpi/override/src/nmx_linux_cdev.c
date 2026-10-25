@@ -20,6 +20,7 @@
 #include <sys/mutex.h>
 #include <sys/conf.h>
 #include <sys/file.h>
+#include <sys/vnode.h>
 #include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/stdarg.h>
@@ -277,8 +278,29 @@ int nmx_cdev_open(void *cookie, int open_id, int fflags)
     struct nmx_open *prev = enter(o);
     struct nmx_bsd_cdevsw *sw = c->si_devsw;
     int err = 0;
-    if (sw->d_fdopen != NULL)
+    /* LinuxKPI hands the open's vnode to the Linux open() as its inode, and drm_open() finds the DRM minor from it
+       (iminor: inode->v_rdev->si_drv1). Without one every DRM open failed with ENODEV (Iris Xe, 10-16). One vnode per
+       node, made at the first open and kept for the node's life. */
+    if (c->nmx_vn == NULL) {
+        struct vnode *vn = malloc(sizeof(*vn), M_NMXCDEV, M_WAITOK | M_ZERO);
+        if (vn != NULL) {
+            mtx_init(&vn->v_interlock, "nmx vnode", NULL, MTX_DEF);
+            vn->v_rdev = c;
+            vn->v_type = VCHR;
+            vn->v_usecount = 1;
+            if (!__atomic_compare_exchange_n(&c->nmx_vn, &(void *){ NULL }, (void *)vn, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                mtx_destroy(&vn->v_interlock);
+                free(vn, M_NMXCDEV);
+            }
+        }
+    }
+    fp->f_vnode = c->nmx_vn;
+    if (sw->d_fdopen != NULL) {
         err = sw->d_fdopen(c, fflags, curthread, fp);
+        /* FreeBSD's d_fdopen convention: ENXIO after finit() means "the file now belongs to the driver" (success) */
+        if (err == ENXIO && fp->f_ops != NULL)
+            err = 0;
+    }
     else if (sw->d_open != NULL)
         err = sw->d_open(c, fflags, 0x2000 /* S_IFCHR */, curthread);
     if (err) {
@@ -365,6 +387,20 @@ int nmx_cdev_ioctl(int open_id, unsigned long cmd, void *data, int fflag)
         err = sw->d_ioctl ? sw->d_ioctl(o->cdev, cmd, data, fflag, curthread) : ENOTTY;
     }
     leave(prev);
+    if (err != 0 && ((cmd >> 8) & 0xff) == 'd') {
+        const unsigned nr = (unsigned)(cmd & 0xff);
+        const int was = err;
+        /* DRM waits (SYNCOBJ_WAIT 0xc3, SYNCOBJ_TIMELINE_WAIT 0xca, I915_GEM_WAIT 0x6c): the LinuxKPI spells Linux's
+         * ETIME as ETIMEDOUT (60), but Mesa on macOS compares errno with the macOS ETIME (101), so every "not done yet"
+         * became VK_ERROR_UNKNOWN and the Metal plugin's first fence wait failed (10-17). */
+        if (err == 60 && (nr == 0xc3 || nr == 0xca || nr == 0x6c))
+            err = 101;
+        if ((nr >= 0xbf && nr <= 0xcd) || nr == 0x6c) {
+            static int logged;
+            if (logged < 24) { logged++; printf("NullMoth drm: wait/syncobj ioctl nr 0x%x -> errno %d%s\n", nr, was,
+                                                err != was ? " (handed to Mesa as ETIME 101)" : ""); }
+        }
+    }
     return err;
 }
 
@@ -508,8 +544,10 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
 {
     uint64_t fixed = (req->flags & NMX_DRM_MMAP_FIXED) ? req->addr : 0;
     req->addr = 0;
-    if ((req->flags & ~NMX_DRM_MMAP_FIXED) != 0 || (req->offset & PAGE_MASK) != 0 || req->size == 0 ||
-        req->size > (1ULL << 40) || (fixed & PAGE_MASK) != 0 || ((req->flags & NMX_DRM_MMAP_FIXED) && fixed == 0))
+    /* page alignment is tested with PAGE_SIZE - 1: linux/mm.h makes PAGE_MASK Linux's ~(PAGE_SIZE - 1), with which
+       every page-aligned offset failed this check (EINVAL on every map, Iris Xe 10-16) */
+    if ((req->flags & ~NMX_DRM_MMAP_FIXED) != 0 || (req->offset & (PAGE_SIZE - 1)) != 0 || req->size == 0 ||
+        req->size > (1ULL << 40) || (fixed & (PAGE_SIZE - 1)) != 0 || ((req->flags & NMX_DRM_MMAP_FIXED) && fixed == 0))
         return EINVAL;
     struct linux_file *filp = o->fp->f_data;
     if (o->fp->f_ops == NULL || filp == NULL || filp->f_op == NULL || filp->f_op->mmap == NULL)
@@ -568,11 +606,19 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
     up_write(&mm->mmap_sem);
     curthread->td_fpop = oldfp;
 
+    int stage = err ? 1 : 0;   /* 1: the driver's mmap or fault handler failed */
     if (err == 0) {
         int writable = (vma->vm_flags & VM_WRITE) != 0;
         err = nmx_xnu_map_user(u->pages, u->npages, u->cache, writable, fixed, &u->uaddr, &u->xmap);
+        if (err)
+            stage = 2;              /* 2: mapping the pages into the process failed */
     }
     if (err) {
+        static int logged;
+        if (logged++ < 20)
+            printf("NullMoth mmap: offset 0x%llx size 0x%llx prot %u fixed 0x%llx failed at %s: %d (cache %d, mixed %d)\n",
+                   (unsigned long long)req->offset, (unsigned long long)size, req->prot, (unsigned long long)fixed,
+                   stage == 1 ? "driver mmap/fault" : "map into process", err, u->cache, u->mixed_cache);
         umap_free(u);
         return err;
     }
