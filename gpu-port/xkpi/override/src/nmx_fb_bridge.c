@@ -149,6 +149,15 @@ void *nmx_drm_of(void *dev) { return drm_of((device_t)dev); }
  * panel alone, so a monitor can never take the laptop's own screen down. -nmxnoext: externals are never lit.
  */
 int nmx_fb_ext_wanted = 1;
+void nmx_i915_hpd_poll(struct drm_device *drm);
+/* b181: turn on polled detection of external outputs (no HPD interrupt arrives on this port) */
+static void bridge_poll_outputs(struct nmx_fb *fb, const char *when)
+{
+    if (!nmx_fb_ext_wanted)
+        return;
+    nmx_i915_hpd_poll(fb->client.dev);
+    printf("NullMoth display: external outputs checked every 10 s (%s; -nmxnoext: off)\n", when);
+}
 static int ms_internal(const struct drm_mode_set *ms)
 {
     if (ms->num_connectors == 0 || ms->connectors[0] == NULL)
@@ -601,8 +610,10 @@ int nmx_fb_power(void *dev, int on)
             nmx_step(on ? "bridge: DPMS on commit" : "bridge: DPMS off commit");
             r = -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
             nmx_step("bridge: DPMS commit returned");
-            if (on)
+            if (on) {
                 cursor_reapply(fbs[i].fb);
+                bridge_poll_outputs(fbs[i].fb, "display on");   /* a resume may have switched polling off */
+            }
             else {
                 fbs[i].fb->cur_shown = -1;
                 fbs[i].fb->cur_hidden = 0;
@@ -702,12 +713,28 @@ static int bridge_go(struct nmx_fb *fb, const char *why)
     fb->deferred = 0;
     if (fb->pending_back && fb->buf2)       /* b167: the newest frame is in the second buffer */
         fb->front = 1;
+    /* b198 (Tahoe: the Apple logo jumps to the lower right at the hand-over, 10-27): with no newer frame in the back
+       buffer, buffer 0 still holds the FIRST WindowServer's picture - its boot logo, drawn for the native 2560x1600
+       layout. When the restarted WindowServer runs a scaled desktop (cur_w x cur_h smaller than the panel, Tahoe:
+       1600x1000), that picture goes on the panel as its top-left cur_w x cur_h part, enlarged by the panel fitter: the
+       logo lands at ~(0.8, 0.8) of the screen. Black instead - the restarted WindowServer's frames follow. Only
+       written, never read (the buffer is in the GPU aperture). */
+    if (fb->front == 0 && fb->mapped && fb->cur_w && fb->cur_h &&
+        (fb->cur_w != fb->info.width || fb->cur_h != fb->info.height)) {
+        char *va = fb->map.is_iomem ? (char *)fb->map.vaddr_iomem : (char *)fb->map.vaddr;
+        if (va) {
+            memset(va, 0, (size_t)fb->info.pitch * fb->info.height);
+            printf("NullMoth display: hand-over: scaled desktop %ux%u on a %ux%u panel - buffer 0 cleared (no stale boot logo)\n",
+                   fb->cur_w, fb->cur_h, fb->info.width, fb->info.height);
+        }
+    }
     bridge_point_outputs(fb);               /* b180: always - each output's mode and picture (panel / external) */
     printf("NullMoth display: boot screen hand-over: %s - committing our scan-out buffer %d\n", why, fb->front);
     nmx_step("bridge: deferred mode set committing");
     int err = -bridge_commit(fb, "hand-over");
     mutex_unlock(&fb->flip_lock);
     bridge_log_outputs(fb, "hand-over");
+    bridge_poll_outputs(fb, "hand-over");
     nmx_step(err ? "bridge: deferred mode set FAILED" : "bridge: deferred mode set committed");
     if (err)
         printf("NullMoth display: the deferred mode set failed (%d)\n", err);

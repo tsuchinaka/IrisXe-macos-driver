@@ -47,14 +47,29 @@ jobs:
           O="$RUNNER_TEMP/nmx/out"; mkdir -p "$O" "$RUNNER_TEMP/nmx/ci"
           git clone -q --depth 1 https://github.com/KhronosGroup/Vulkan-Headers "$RUNNER_TEMP/vkh"
           cd plugin
-          B="$O/NVMTLDriver.bundle/Contents/MacOS"; mkdir -p "$B"
-          xcrun clang -arch x86_64 -bundle -fobjc-arc -O1 -mmacosx-version-min=14.0 -Wno-protocol -Wno-incomplete-implementation \
-            -I"$RUNNER_TEMP/vkh/include" -o "$B/NVMTLDriver" NVMTLDevice.m \
-            -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework QuartzCore \
-            2> "$RUNNER_TEMP/nmx/ci/NVMTLDriver.err" || { grep -A3 ': error:' "$RUNNER_TEMP/nmx/ci/NVMTLDriver.err" | head -60; exit 1; }
-          codesign -f -s - "$B/NVMTLDriver"
-          echo "NVMTLDriver: $(stat -f %z "$B/NVMTLDriver") bytes, uuid $(otool -l "$B/NVMTLDriver" | awk '/uuid/{print $2; exit}')"
-          echo "### NVMTLDriver built ($(stat -f %z "$B/NVMTLDriver") bytes)" >> "$GITHUB_STEP_SUMMARY"
+          # b190 (speed / heat): the plugin a user installs is the QUIET build (-DNVMTL_RELEASE=1): only failures reach
+          # the log. The verbose build wrote every nvlog line to syslog AND to a file - in WindowServer with an fsync
+          # per line - in every Metal process. The verbose one is still built, for diagnosis: out/debug/NVMTLDriver.bundle
+          build_one() {  # $1 bundle dir, $2 extra flags, $3 label
+            B="$1/Contents/MacOS"; mkdir -p "$B"
+            xcrun clang -arch x86_64 -bundle -fobjc-arc -O1 -mmacosx-version-min=14.0 $2 -Wno-protocol -Wno-incomplete-implementation \
+              -I"$RUNNER_TEMP/vkh/include" -o "$B/NVMTLDriver" NVMTLDevice.m \
+              -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework QuartzCore \
+              2> "$RUNNER_TEMP/nmx/ci/NVMTLDriver-$3.err" || { grep -A3 ': error:' "$RUNNER_TEMP/nmx/ci/NVMTLDriver-$3.err" | head -60; return 1; }
+            codesign -f -s - "$B/NVMTLDriver"
+            echo "NVMTLDriver ($3): $(stat -f %z "$B/NVMTLDriver") bytes, uuid $(otool -l "$B/NVMTLDriver" | awk '/uuid/{print $2; exit}')"
+            echo "### NVMTLDriver $3 built ($(stat -f %z "$B/NVMTLDriver") bytes)" >> "$GITHUB_STEP_SUMMARY"
+          }
+          build_one "$O/NVMTLDriver.bundle" "-DNVMTL_RELEASE=1" quiet
+          build_one "$O/debug/NVMTLDriver.bundle" "" verbose
+
+      # b203: the small installer app ("IrisXe Manager.app") lands in out/ next to the kexts and the plugin
+      - name: Build IrisXe Manager (installer app)
+        if: always()
+        continue-on-error: true
+        run: |
+          bash manager/build.sh "$RUNNER_TEMP/nmx/out"
+          echo "### IrisXe Manager.app built" >> "$GITHUB_STEP_SUMMARY"
 
       # b155: the shader translator (Rust) built here too, so a translator fix needs no Mesa build. It lands in
       # out/nvmtl/libnvmtl_translate.dylib - install with tools/macos-helpers/nmx-xlate-update.sh.

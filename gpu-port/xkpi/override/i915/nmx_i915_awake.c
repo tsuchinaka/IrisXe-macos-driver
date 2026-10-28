@@ -256,3 +256,17 @@ int nmx_i915_psr(struct drm_device *drm, int on)
     }
     return err ? err : n;
 }
+
+/*
+ * b181: external displays are found by polling. The 10-25 TV test: plugging HDMI in after boot produced no hot-plug
+ * event at all (no HPD interrupt reaches i915 on this port), so the TV stayed dark. i915's own fallback for that case
+ * (used when the display is runtime-suspended) switches every HPD connector to polled detection: DRM's output poll
+ * worker then checks them every 10 s and sends the normal hot-plug event on a change - which the display bridge handles.
+ */
+#include "display/intel_hotplug.h"
+
+void nmx_i915_hpd_poll(struct drm_device *drm)
+{
+    if (drm)
+        intel_hpd_poll_enable(to_i915(drm));
+}

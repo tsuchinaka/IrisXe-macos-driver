@@ -63,11 +63,11 @@ a = "\tret = intel_atomic_prepare_commit(state);\n\tif (ret) {\n"
 if s.count(a) != 1:
     print("ERROR: prepare_commit anchor"); sys.exit(1)
 s = s.replace(a, '\tnmx_step("commit: prepare planes (pins the framebuffer)");\n' + a.replace("\tif (ret) {\n", "") +
-              '\tprintk("NullMoth commit: prepare planes done, ret=%d\\n", ret);\n\tnmx_step("commit: prepare planes returned");\n\tif (ret) {\n', 1)
+              '\tif (!nmx_steps_quiet || ret) printk("NullMoth commit: prepare planes done, ret=%d\\n", ret);\n\tnmx_step("commit: prepare planes returned");\n\tif (ret) {\n', 1)
 a = "\tret = intel_atomic_setup_commit(state, nonblock);\n"
 if s.count(a) != 1:
     print("ERROR: setup_commit anchor"); sys.exit(1)
-s = s.replace(a, a + '\tprintk("NullMoth commit: setup commit done, ret=%d\\n", ret);\n\tnmx_step("commit: setup commit returned");\n', 1)
+s = s.replace(a, a + '\tif (!nmx_steps_quiet || ret) printk("NullMoth commit: setup commit done, ret=%d\\n", ret);\n\tnmx_step("commit: setup commit returned");\n', 1)
 
 # start of the tail
 a = "\tint i;\n\n\tfor_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i)\n\t\tintel_atomic_dsb_prepare(state, crtc);\n"
@@ -105,6 +105,9 @@ if s.count(a) != 1:
     print("ERROR: pipe power anchor"); sys.exit(1)
 s = s.replace(a, "\t\t\t\t\t\t       POWER_DOMAIN_PIPE(crtc->pipe))) {\n\t\tif (crtc->pipe == PIPE_A)\n\t\t\tprintk(\"NullMoth readout: pipe A power domain reads as off\\n\");\n\t\treturn false;\n\t}\n\n\tpipe_config->shared_dpll = NULL;\n", 1)
 
-s = "/* NMX_COMMIT_TRACE */\nextern void nmx_step(const char *what);\nextern void nmx_stepn(const char *what, long n);\n" + s
+# b190 (speed / heat): the two printk above ran on EVERY commit - with a 60 Hz desktop ~120 kernel log lines a second
+# (10381 in 5 min, tahoe-icons-errors 10-26), each one work for logd. Quiet like the nmx_step breadcrumbs once
+# WindowServer owns the screen (nmx_steps_quiet, b126); a failed commit (ret != 0) is still logged.
+s = "/* NMX_COMMIT_TRACE */\nextern void nmx_step(const char *what);\nextern void nmx_stepn(const char *what, long n);\nextern volatile int nmx_steps_quiet;\n" + s
 p.write_text(s)
 print("patched", p)

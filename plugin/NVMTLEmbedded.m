@@ -43,7 +43,14 @@ static id nvmtl_resid_lookup(uint64_t token)
     return resource;
 }
 
-uint64_t nvmtl_resid_for_texture(id t) { return nvmtl_resid_assign(t, 0, nvmtl_vk_bindless_put([(NVMTLTexture *)t nvsampleview])); }
+uint64_t nvmtl_resid_for_texture(id t) {
+    /* b202 icon test: which textures shaders reach through gpuResourceID (argument buffers), with their swizzle state */
+    { static int on = -1; if (on < 0) { const char *me = getprogname(); on = me && !strcmp(me, "iconservicesagent") && access("/Library/GPUBundles/nvmtl-icontest", F_OK) == 0; }
+      if (on) { static int n; NVMTLTexture *x = (NVMTLTexture *)t;
+          if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 400)
+              syslog(LOG_NOTICE, "NVMTL ICONTEST resid: %p %ux%u fmt %lu hasSwz %d swzView %d%s%s", (__bridge void *)t, [x nvi]->w, [x nvi]->h,
+                     (unsigned long)x->_fmt, (int)x->_hasSwz, x->_swzView != NULL, x->_subPlaced ? " HEAP-PLACED" : "", x->_parent ? " VIEW" : ""); } }
+    return nvmtl_resid_assign(t, 0, nvmtl_vk_bindless_put([(NVMTLTexture *)t nvsampleview])); }
 uint64_t nvmtl_resid_for_sampler(id s) { return nvmtl_resid_assign(s, NVMTL_RESID_SAMPLER, 0); }
 void nvmtl_resid_texture_gone(uint64_t token) { if (token & NVMTL_RESID_HEAP) nvmtl_vk_bindless_drop((uint32_t)(token & 0xffffffffu)); }
 

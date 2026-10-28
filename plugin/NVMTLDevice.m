@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <os/lock.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
@@ -550,7 +551,15 @@ static int nvmtl_pixfmt(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8)
     case MTLPixelFormatRGBA8Sint:        *vk = 42 ;          *bpp = 4;  return 0;
     case MTLPixelFormatBGRA8Unorm:       *vk = 44 ;         *bpp = 4;  return 0;
     case MTLPixelFormatBGRA8Unorm_sRGB:  *vk = 50 ;          *bpp = 4;  return 0;
-    case MTLPixelFormatRGB10A2Unorm:     *vk = 64 ; *bpp = 4; return 0;
+    case MTLPixelFormatRGB10A2Unorm: {
+        /* b197 experiment (Tahoe icons): iconservicesagent hands the CPU 130x130 RGB10A2 maps whose flat areas read
+           (R 1.0, G 0.5, B 0.5) - as if red and blue were swapped. With /Library/GPUBundles/nvmtl-iconswap present,
+           iconservicesagent stores RGB10A2 as BGR10A2 (red <-> blue in memory) to test that. */
+        static int sw = -1;
+        if (sw < 0) { const char *me = getprogname();
+            sw = me && !strcmp(me, "iconservicesagent") && access("/Library/GPUBundles/nvmtl-iconswap", F_OK) == 0;
+            if (sw) syslog(LOG_NOTICE, "NVMTL ICONTEST iconservicesagent: RGB10A2 stored as BGR10A2 (nvmtl-iconswap)"); }
+        *vk = sw ? 58 : 64; *bpp = 4; return 0; }
     case MTLPixelFormatRGB10A2Uint:      *vk = 68 ; *bpp = 4; return 0;
     case MTLPixelFormatBGR10A2Unorm:     *vk = 58 ; *bpp = 4; return 0;
     case MTLPixelFormatRG11B10Float:     *vk = 122 ; *bpp = 4; return 0;
@@ -811,6 +820,26 @@ static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
     t->_fbo = nvmtl_desc_fbo(d);
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
+    /* b186 diagnostic (Tahoe yellow icons, 10-26): every new (IOSurface pixel format, Metal format) pair is logged once
+       per process - which surface formats the apps hand WindowServer, and as what WindowServer samples them (a 10-bit
+       'w30r' / BGR10_XR surface read as 8-bit BGRA would give wrong colours). */
+    if (surf) {
+        static struct { uint32_t fcc; NSUInteger mf; } pairs[64]; static int npairs; static os_unfair_lock pl = OS_UNFAIR_LOCK_INIT;
+        const uint32_t fcc = (uint32_t)IOSurfaceGetPixelFormat(surf);
+        int seen = 0;
+        os_unfair_lock_lock(&pl);
+        for (int i = 0; i < npairs; i++) if (pairs[i].fcc == fcc && pairs[i].mf == d.pixelFormat) seen = 1;
+        if (!seen && npairs < 64) { pairs[npairs].fcc = fcc; pairs[npairs].mf = d.pixelFormat; npairs++; }
+        os_unfair_lock_unlock(&pl);
+        if (!seen) {
+            char c4[5] = { (char)(fcc >> 24), (char)(fcc >> 16), (char)(fcc >> 8), (char)fcc, 0 };
+            for (int i = 0; i < 4; i++) if (c4[i] < 32 || c4[i] > 126) c4[i] = '?';
+            syslog(LOG_NOTICE, "NVMTL SURFFMT %s: IOSurface '%s' (0x%08x) %zux%zu bpe %zu plane %lu -> Metal format %lu usage 0x%lx swizzle %u%u%u%u",
+                   getprogname(), c4, fcc, IOSurfaceGetWidth(surf), IOSurfaceGetHeight(surf), IOSurfaceGetBytesPerElement(surf),
+                   (unsigned long)plane, (unsigned long)d.pixelFormat, (unsigned long)d.usage,
+                   (unsigned)d.swizzle.red, (unsigned)d.swizzle.green, (unsigned)d.swizzle.blue, (unsigned)d.swizzle.alpha);
+        }
+    }
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
     /* b163: Photo Booth stayed black (10-24). CoreImage renders the camera picture into the layer's drawable with
@@ -841,6 +870,29 @@ static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
     t->_stex = t->_i.storage != 0;
     t->_usage = repUsage;
     nvmtl_texture_desc_swizzle(t, d);
+    /* b187 (Tahoe yellow System Settings icons, 10-26): WindowServer samples 'LA08' (luminance + alpha) IOSurfaces as
+       RG8Unorm with no swizzle in the descriptor (b186 SURFFMT). Apple's drivers read luminance formats as L,L,L,A;
+       plain RG8 gives (L, A, 0, 1) - a white glyph comes out yellow. So luminance IOSurfaces get the implied swizzle:
+       'LA08'/'LA16' as R,R,R,G and 'L008'/'L016' as R,R,R,1. Off: touch /Library/GPUBundles/nvmtl-nolumswizzle */
+    if (surf && !t->_hasSwz) {
+        static int lumOn = -1;
+        if (lumOn < 0) lumOn = access("/Library/GPUBundles/nvmtl-nolumswizzle", F_OK) != 0;
+        const uint32_t lf = (uint32_t)IOSurfaceGetPixelFormat(surf);
+        const int la = (lf == 'LA08' || lf == 'LA16'), l1 = (lf == 'L008' || lf == 'L016');
+        const MTLPixelFormat pf = d.pixelFormat;
+        const int rg = (pf == MTLPixelFormatRG8Unorm || pf == MTLPixelFormatRG16Unorm || pf == MTLPixelFormatRG16Float);
+        const int r1 = (pf == MTLPixelFormatR8Unorm || pf == MTLPixelFormatR16Unorm || pf == MTLPixelFormatR16Float);
+        if (lumOn && ((la && rg) || (l1 && r1))) {
+            MTLTextureDescriptor *sd = [d copy];
+            sd.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed,
+                                                       la ? MTLTextureSwizzleGreen : MTLTextureSwizzleOne);
+            nvmtl_texture_desc_swizzle(t, sd);
+            if (t->_swzView) t->_lum = YES;
+            static int said;
+            if (said++ < 4) syslog(LOG_NOTICE, "NVMTL LUMSWZ %s: luminance IOSurface 0x%08x as Metal format %lu -> swizzle R,R,R,%s%s",
+                                   getprogname(), lf, (unsigned long)pf, la ? "G" : "1", t->_swzView ? "" : " (view NOT made)");
+        }
+    }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }

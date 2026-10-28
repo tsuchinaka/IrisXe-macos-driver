@@ -33,8 +33,17 @@
 #define FIRMWARE_ROOT "/Library/NullMoth/firmware/"
 #define FIRMWARE_MAX (64u << 20)    /* the largest GPU firmware file is a few MB; anything bigger is not one */
 
+extern "C" int nmx_xnu_firmware_embedded(const char *name, const void **data, size_t *size);
+extern "C" unsigned nmx_xnu_firmware_embedded_count(void);
+
 extern "C" int nmx_xnu_wait_firmware_root(int max_secs)
 {
+    /* b184: firmware built into the kext - nothing to wait for (loaded by OpenCore, the disk is not there yet) */
+    if (nmx_xnu_firmware_embedded_count() > 0) {
+        IOLog("NullMoth GPU: %u firmware file(s) built into the driver - not waiting for /Library/NullMoth/firmware\n",
+              nmx_xnu_firmware_embedded_count());
+        return 0;
+    }
     for (int i = 0; i < max_secs * 2; i++) {
         /* no path lookup at all until a root vnode exists: before that, a lookup has nothing to start from */
         vnode_t root = vfs_rootvnode();
@@ -62,6 +71,25 @@ extern "C" int nmx_xnu_firmware_load(const char *name, void **data, size_t *size
     *size = 0;
     if (name == nullptr || strnstr(name, "..", strlen(name) + 1) != nullptr || name[0] == '/')
         return EINVAL;
+    {   /* b184: built-in copy first */
+        const void *bd = nullptr; size_t bs = 0;
+        if (nmx_xnu_firmware_embedded(name, &bd, &bs) && bs > 0 && bs <= FIRMWARE_MAX) {
+            void *buf = IOMalloc(bs);
+            if (buf == nullptr)
+                return ENOMEM;
+            memcpy(buf, bd, bs);
+            *data = buf;
+            *size = bs;
+            IOLog("NullMoth GPU: firmware %s from the driver itself (%zu bytes)\n", name, bs);
+            return 0;
+        }
+    }
+    {   /* before the root file system exists a path lookup has nothing to start from */
+        vnode_t root = vfs_rootvnode();
+        if (root == NULLVP)
+            return ENOENT;
+        vnode_put(root);
+    }
     char path[512];
     if (snprintf(path, sizeof(path), "%s%s", FIRMWARE_ROOT, name) >= (int)sizeof(path))
         return ENAMETOOLONG;

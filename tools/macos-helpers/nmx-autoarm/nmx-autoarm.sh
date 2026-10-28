@@ -141,6 +141,19 @@ A=/Library/GPUBundles/nvmtl-allow.txt
 grep -qx '!WindowServer' "$A" 2>/dev/null || echo '!WindowServer' >> "$A"
 # b124: the live Sequoia / Macintosh wallpapers draw with Metal; without a device they fail and the previous wallpaper stays
 for n in WallpaperSequoiaExtension WallpaperMacintoshExtension; do grep -qx "!$n" "$A" 2>/dev/null || echo "!$n" >> "$A"; done
+# b190: iconservicesagent (Tahoe's icon renderer) kept off the GPU - on our device app icons and Settings glyphs come
+# out as solid yellow squares. b193 let it back on after a capture that looked right; the user's screen recording
+# (10-27) showed the yellow squares again, so b194 restores the default: off the GPU. Testing on the GPU:
+# sudo touch /Library/GPUBundles/nvmtl-icongpu (and restart). The icon test (nvmtl-icontest) also leaves it on.
+if [ "$(uname -r | cut -d. -f1)" -ge 25 ] && [ ! -e /Library/GPUBundles/nvmtl-icongpu ] && [ ! -e /Library/GPUBundles/nvmtl-icontest ]; then
+    if ! grep -q '^ *- *iconservicesagent *$' "$A" 2>/dev/null; then
+        { echo '- iconservicesagent'; cat "$A"; } > "$A.tmp" && cat "$A.tmp" > "$A"; rm -f "$A.tmp"
+        rm -rf /Library/Caches/com.apple.iconservices.store; step "Tahoe: iconservicesagent kept off the GPU, icon cache cleared"
+    fi
+elif grep -q '^ *- *iconservicesagent *$' "$A" 2>/dev/null; then
+    grep -v '^ *- *iconservicesagent *$' "$A" > "$A.tmp" && cat "$A.tmp" > "$A"; rm -f "$A.tmp"
+    rm -rf /Library/Caches/com.apple.iconservices.store; step "iconservicesagent on the GPU (test file present), icon cache cleared"
+fi
 # b124: the shader reader must be there (a whole-bundle replace from the kext build deletes it) - say so loudly
 [ -f /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib ] || step "WARNING: NVMTLDriver.bundle has NO air-runtime/libLLVM.dylib - new shaders will fail (restore it: nmx-plugin-update.sh)"
 # b112: NMXAccel refuses nvaccelfb until WindowServer has opened the screen (arming earlier was the Phase 3 panic,

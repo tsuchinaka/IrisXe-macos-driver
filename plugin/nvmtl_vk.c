@@ -844,6 +844,13 @@ static int nvmtl_vk_initialize(void)
         v12.shaderOutputLayer = q12.shaderOutputLayer; v12.shaderOutputViewportIndex = q12.shaderOutputViewportIndex;
         nvlog("vk: par1 shaderOutputLayer %d, shaderOutputViewportIndex %d", q12.shaderOutputLayer, q12.shaderOutputViewportIndex);
         const char *off = getenv("NVMTL_NO_BINDLESS");
+        /* b200 icon experiment: the yellow glyph layer is drawn by primitive_image_fragment from a texture that reads
+           (1, 1, 0, 1) everywhere - like a distance-field RG16F texture instead of the glyph image: a wrong texture
+           reaching the shader. /Library/GPUBundles/nvmtl-iconnobindless turns bindless textures off in
+           iconservicesagent only, to see whether the bindless heap hands it the wrong texture. */
+        { const char *me = getprogname();
+          if (me && !strcmp(me, "iconservicesagent") && access("/Library/GPUBundles/nvmtl-iconnobindless", F_OK) == 0) {
+              off = "1"; syslog(LOG_NOTICE, "NVMTL ICONTEST iconservicesagent: bindless textures OFF (nvmtl-iconnobindless)"); } }
         g_bindless = gpf2 && !(off && *off == '1') && q12.descriptorIndexing && q12.runtimeDescriptorArray &&
                      q12.shaderSampledImageArrayNonUniformIndexing && q12.descriptorBindingPartiallyBound &&
                      q12.descriptorBindingSampledImageUpdateAfterBind && q12.descriptorBindingUpdateUnusedWhilePending;

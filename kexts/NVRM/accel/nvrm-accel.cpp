@@ -57,7 +57,8 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
 #include <IOKit/IODeviceMemory.h>
-#include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
+#include "tahoe_fwd.h"
+#include "tahoe_fwd_nmx.h"   // b185: the same for the Intel modern display classes   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
 #include <libkern/OSAtomic.h>
 extern "C" uint64_t mach_absolute_time(void);
 #include "nvaccel_stubs.h"
@@ -147,10 +148,11 @@ public:
     }
 };
 OSDefineMetaClassAndStructors(NVDisplayMachine, IOAccelLegacyDisplayMachine)
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
 /* b116: modern display machine (Apple Intel: IGAccelDisplayMachine : IOAccelDisplayMachine), picked by nmxmodern=1 */
 class NMXDisplayMachineM : public IOAccelDisplayMachine {
     OSDeclareDefaultStructors(NMXDisplayMachineM)
+    NMX_TAHOE_FWD_NMXDisplayMachineM
 public:
     bool displayModeWillChange() APPLE_KEXT_OVERRIDE { ALOG("DM(modern) displayModeWillChange"); return true; }
     bool displayModeDidChange() APPLE_KEXT_OVERRIDE {
@@ -163,7 +165,7 @@ OSDefineMetaClassAndStructors(NMXDisplayMachineM, IOAccelDisplayMachine)
 #endif
 static int nmxModern()
 {
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
     static int on = -1;
     if (on < 0) { int v = 0; on = (PE_parse_boot_argn("nmxmodern", &v, sizeof v) && v) ? 1 : 0;
                   IOLog("NMXAccel: display classes %s\n", on ? "MODERN (nmxmodern=1, b116: IOAccelSurface / IOAccelDisplayPipe / IOAccelDisplayMachine, as Apple's Intel driver)"
@@ -284,14 +286,14 @@ public:
     void      teardownDevice(IOPCIDevice *pci) APPLE_KEXT_OVERRIDE { ALOG("teardownDevice(%p)", pci); }
     OSObject *createKernelGPUTask() APPLE_KEXT_OVERRIDE { return newGPUTask("createKernelGPUTask"); }
     OSObject *newDisplayPipe() APPLE_KEXT_OVERRIDE {
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
         if (nmxModern()) { NMXDisplayPipeM *mp = OSTypeAlloc(NMXDisplayPipeM); ALOG("newDisplayPipe -> %p (modern, b116)", mp); return mp; }
 #endif
         NVDisplayPipe *p = OSTypeAlloc(NVDisplayPipe);
         if (!p) { ALOG("newDisplayPipe: OSTypeAlloc FAILED - the family will store this NULL unchecked"); return NULL; }
         ALOG("newDisplayPipe -> %p", p); return p; }
     OSObject *newDisplayMachine() APPLE_KEXT_OVERRIDE {
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
         if (nmxModern()) { NMXDisplayMachineM *md = OSTypeAlloc(NMXDisplayMachineM); fDM = md; ALOG("newDisplayMachine -> %p (modern, b116)", md); return md; }
 #endif
         NVDisplayMachine *d = OSTypeAlloc(NVDisplayMachine);
@@ -300,7 +302,7 @@ public:
     OSObject *newGLContext() APPLE_KEXT_OVERRIDE { NVGLContext *c = OSTypeAlloc(NVGLContext); ALOG("newGLContext -> %p", c); return c; }
     OSObject *newCLContext() APPLE_KEXT_OVERRIDE { NVCLContext *c = OSTypeAlloc(NVCLContext); ALOG("newCLContext -> %p", c); return c; }
     OSObject *newSurface() APPLE_KEXT_OVERRIDE {
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
         if (nmxModern()) { NMXSurfaceM *m = OSTypeAlloc(NMXSurfaceM); static SInt32 n; if (OSIncrementAtomic(&n) < 8) ALOG("newSurface -> %p (modern, b116)", m); return m; }
 #endif
         NVSurface *o = OSTypeAlloc(NVSurface); ALOG("newSurface -> %p", o); return o; }
@@ -906,7 +908,7 @@ template <class PipeT> static IOAccelMemory *nvpipe_initFramebufferResource(Pipe
     return (IOAccelMemory *)m;
 }
 IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res) { return nvpipe_initFramebufferResource(this, index, res); }
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
 IOAccelMemory *NMXDisplayPipeM::initFramebufferResource(unsigned int index, IOAccelResource2 *res) { return nvpipe_initFramebufferResource(this, index, res); }
 #endif
 
@@ -1092,7 +1094,7 @@ void NVDisplayPipe::free()
     nvpipe_iopDropSources(this);
     IOAccelLegacyDisplayPipe::free();
 }
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
 void NMXDisplayPipeM::free()
 {
     nvpipe_iopDropSources(this);
@@ -1122,7 +1124,7 @@ IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *)
 {
     return kIOReturnSuccess;
 }
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
 IOReturn NMXDisplayPipeM::validateTransaction(IOAccelDisplayPipeTransaction2 *)
 {
     return kIOReturnSuccess;
@@ -1134,7 +1136,7 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
     return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
 }
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
 bool NMXDisplayPipeM::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
     return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
@@ -1398,7 +1400,7 @@ template <class PipeT> static IOReturn nvpipe_performTransaction(PipeT *self, IO
 }
 
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn) { return nvpipe_performTransaction(this, txn); }
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe (forwards: tahoe_fwd_nmx.h) */
 /*
  * b146: tell the family the transaction is done. The copy (and the flip) finish inside performTransaction, but nothing
  * raised the transaction interrupt afterwards, so IOAccelDisplayPipe only re-checked isTransactionComplete when something
@@ -2571,6 +2573,7 @@ IOReturn NVAccel::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, 
 }
 
 NM_TAHOE_FWD_DEFS
+NMX_TAHOE_FWD_DEFS
 
 #ifdef NMX_ACCEL
 /* b98: frame timing, one log line per second while WindowServer swaps (no line in an idle second). The lag of 10-20 had

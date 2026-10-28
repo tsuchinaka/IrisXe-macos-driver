@@ -526,3 +526,143 @@ implement the transaction + generateFlip set the way IGAccelDisplayPipe does, wi
   is repeated with the panel alone (bridge_commit) - a monitor cannot take the laptop screen down. Logs "NullMoth
   display: output <name> (...)" after hand-over, hot-plug and desktop size changes. -nmxnoext: externals never lit.
   tools/macos-helpers/nmx-display.sh collects it. macOS does not know about the external yet (mirror only).
+- 10-25 TV test (b180): nothing on the TV. Log: the panel is 2560x1600 (desktop 1680x1050 scaled); at hand-over only
+  eDP-1 is listed; plugging HDMI in later produced NO hot-plug event (the six DRM.CONNECTOR.HOTPLUG lines are only the
+  ones at driver load) - no HPD interrupt reaches i915 on this port, so bridge_hotplug never ran.
+- b181 (NMXGPU): nmx_i915_hpd_poll -> intel_hpd_poll_enable (i915's own fallback when HPD is unavailable): every HPD
+  connector becomes polled, DRM's output poll worker checks them every 10 s and sends the normal hot-plug event. Turned
+  on at the boot screen hand-over and again at every display-on (a resume may switch polling off). -nmxnoext: no polling.
+- 10-25: external displays PARKED (b181 polling untested; user stays on b180). Next: macOS 26 Tahoe.
+- Tahoe plan: T0 user installs Tahoe on its own APFS volume next to Sequoia (newest OpenCore + kexts on a second USB
+  stick; our kexts live in each volume's /Library/Extensions, so Tahoe starts clean). T1 NMXGPU alone on Tahoe (display,
+  brightness, PSR, sleep; no nmxws arming - the autoarm daemon is per volume). T2 NMXAccel for Tahoe: the upstream
+  NM_TAHOE layout (re/ + tahoe_fwd.h) exists, but our Intel display classes are "NMX_ACCEL && !NM_TAHOE" (12 blocks).
+  T3 the Metal plugin + translator on Tahoe (mtlprobe / mtlwindow first, then WindowServer).
+- b182 (CI): ci-build-intel.sh also builds out/tahoe/NMXAccel.kext with -DNM_TAHOE (stage nmxaccel26, non-fatal) to
+  see what the Tahoe accelerator build needs.
+- 10-25: Tahoe installed on its own volume (EFI: OpenCore 1.0.8 + AirportItlwm-Tahoe as a second kext, 25.x only).
+  Wireless mouse not working there (open, not the GPU driver).
+- b183 (NMXGPU): the boot-logo hold also ends 15 s after NMXGPUFB start when no NMXAccel service exists ("no accelerator
+  (NMXAccel) after 15 s") - for T1 on Tahoe (NMXGPU alone, same OpenCore boot-args as Sequoia, no autoarm helper on that
+  volume) the logo otherwise stayed for the 60 s timeout.
+- 10-26 Tahoe T1: NMXGPU from /Library/Extensions on Tahoe hung at the Apple logo (hot); Tahoe's log could not be read
+  from Sequoia (log archive empty). NEW PROJECT (user): load the driver from OpenCore - design in
+  docs/OPENCORE-INJECTION.md (U1 firmware in the kext, U2 NMXGPU injected on Sequoia, U3 NMXAccel too if its
+  dependencies are in the boot collection, U4 Tahoe from the USB stick only).
+- b184 (U1): xnu/nmx_fw_embedded.cpp + gen_fw_embedded.py (CI stage fwembed, before runtime): tgl_dmc_ver2_12,
+  tgl_guc_70.1.1, tgl_huc_7.9.3 built in (SHA-256 checked); nmx_xnu_firmware_load tries them first, and no path lookup
+  before a root vnode exists; nmx_xnu_wait_firmware_root returns at once when firmware is built in.
+  tools/macos-helpers/nmx-bootkc-check.sh: are IOAcceleratorFamily2 / IOSurface in the boot collection (decides U3).
+- 10-26 Tahoe 26.7.1: the earlier white screen / 1 fps was NO display driver at all (OpenCore blocked IONDRVSupport for
+  every macOS, and NMXGPU was installed but not approved). Block limited to 24.x -> IONDRV desktop (slow). Then NMXGPU
+  approved + IONDRV blocked again: T1 WORKS on Tahoe - "driving 8086:9a49", firmware framebuffer taken over, NMXGPUFB
+  (NMXAppleIntelFramebuffer) 2560x1600@60 is the display, hardware cursor, backlight, "Intel Iris Xe Graphics 1536 MB".
+  Same NMXGPU binary as Sequoia (b184). Next: T2 = out/tahoe/NMXAccel.kext loaded, not armed.
+- 10-26 Tahoe T2/T3: NMXAccel (out/tahoe, NM_TAHOE build) loads after approval ("Dependencies: OK", "Bad code signature"
+  is normal), IOGraphicsAccelerator2::start -> 1, WindowServer opens a display pipe; the Metal plugin (Sequoia's
+  /Library/GPUBundles copied over) works: mtlprobe "Metal compute works", mtlwindow 60 fps, 0 GPU errors.
+- b185 (NMXAccel, Tahoe): the Intel MODERN display classes (NMXSurfaceM / NMXDisplayPipeM / NMXDisplayMachineM, b116,
+  what nmxmodern=1 uses on Sequoia) are now built for Tahoe too. tahoe_fwd_nmx.h forwards IOAccelSurface's 4 slots Tahoe
+  made private (set_shape, set_shape_backing_length_ext, surface_lock_options, surface_unlock_options) through
+  __ZTV14IOAccelSurface (same offsets as tahoe_fwd.h's NVSurface forwards). setStereo / submitCopyForward / submitUpdate
+  belong to the legacy classes only. More unresolved symbols, if Tahoe reports any, get added the same way.
+- 10-26 b185 on Tahoe 26.7.1: "display classes MODERN", NMXAccel loads, no unresolved symbols. With NVRMAGDC.kext and
+  autoarm v11 installed on the Tahoe volume: armed at 16 s, WindowServer restarted, "armed WindowServer up for 60 s",
+  debug.nvaccelfb = 1. FIRST ACCELERATED TAHOE BOOT (same NMXGPU / plugin binaries as Sequoia).
+- 10-26 Tahoe accelerated: wallpaper + Dock right, a little lag. System Settings sidebar icons yellow squares (System
+  Settings was on the GPU list copied from Sequoia; test: removed from nvmtl-allow.txt). nvmtl-ws.log: no translation
+  errors. USB dead on Tahoe (not GPU): both xHCI (TXHC 9a13, PCH a0ed) attach, createPorts, then XHCI goes to D3 and no
+  device ever enumerates (not even the OpenCore stick) - open, next: ioreg comparison with Sequoia.
+- 10-26 Tahoe yellow System Settings icons: correct WITHOUT acceleration, yellow with it (also with System Settings off
+  the GPU list) -> WindowServer's GPU path. Lead (JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe): Tahoe's icons use the
+  10-bit extended-range layer format w30r / BGR10_XR, Apple-silicon only. No "pixel format ... NOT carried" in
+  nvmtl-ws.log, so WindowServer does not ask for BGR10_XR textures - maybe it samples w30r surfaces as BGRA8.
+  b186 (plugin): syslog "NVMTL SURFFMT" once per (IOSurface fourcc, Metal format) pair per process.
+  Result (Tahoe, 10-26): WindowServer samples 'LA08' (luminance+alpha) 240x240 icon surfaces as RG8Unorm with no
+  swizzle -> (L, A, 0): white = yellow. b187 (plugin): luminance IOSurfaces get the implied swizzle (LA -> R,R,R,G;
+  L -> R,R,R,1), syslog "NVMTL LUMSWZ"; off with /Library/GPUBundles/nvmtl-nolumswizzle.
+  b187 test (10-26): swizzle applied to the IOSurface texture, icons unchanged -> WindowServer reads the pixels via
+  something else. b188 (plugin): the luminance reading follows views and blit copies of the texture (_lum flag,
+  nvmtl_texture_lum_apply); binds of luminance textures are logged with whether the swizzled view was used.
+  b188 test (10-26): the LA08 texture IS bound through the swizzled view, icons unchanged. Screenshot: the coloured
+  icon tile is right, the glyph is a solid yellow square - not a yellow-tinted glyph. b189 diagnostic: syslog
+  "NVMTL LUMDATA" (surface statistics + 20x10 alpha picture) and the fragment function / blend / target format at bind.
+
+## b190 (10-26) Tahoe icons
+  The yellow glyphs come from iconservicesagent (Tahoe IconRendering: stitched / visible-function Core Image graphs,
+  custom_effect_fragment, [[color(n)]] reads), not from WindowServer - the LA08 surface was a drop shadow (b189 LUMDATA:
+  L=0 everywhere, round alpha). With "- iconservicesagent" in nvmtl-allow.txt and the icon cache cleared, every icon is
+  right (user 10-26). autoarm now does that on Darwin >= 25. The IconRendering shader path stays open.
+  b190 speed / heat (docs/SPEEDUP.md S1): the per-commit "NullMoth commit:" printk (two per display commit, ~10k lines
+  in 5 min) only before WindowServer owns the screen or on failure; CI builds the plugin quiet (-DNVMTL_RELEASE=1) as
+  out/NVMTLDriver.bundle and verbose as out/debug/NVMTLDriver.bundle; tools/macos-helpers/nmx-speed.sh measures it.
+  Tahoe USB fixed in the user's EFI (USBMap with Tahoe's usb-port-number / usb-port-type keys); Tahoe sound with
+  SimpleHDA (Apple removed AppleHDA in Tahoe) - EFI-side, not driver.
+  b191 (S3 icon test): plugin captures small render passes in iconservicesagent when /Library/GPUBundles/nvmtl-icontest
+  exists (readback after the command buffer completes; files in its cache dir, syslog "NVMTL ICONTEST" with the
+  fragment functions); tools/macos-helpers/nmx-icontest.sh on|collect|off; autoarm leaves iconservicesagent alone
+  while the test file exists. nmx-speed.sh writes a new file per run.
+  b192 (10-27): Tahoe hung in "commit tail: SAGV post-plane" (nullmoth-last-step 139) - first on the desktop, then on
+  every boot after the boot guard was cleared: the PCODE request that relaxes the memory QGV points never returned.
+  patch_i915_nosagv.py: intel_has_sagv() false unless boot-arg nmxsagv=1 (nmx_sagv_on() in nmx_kext.cpp), so i915 sends
+  no SAGV / QGV PCODE requests - the state of a BIOS with SAGV disabled.
+  b193 (10-27): the b192 icon capture (120 passes in iconservicesagent: path / accumulator / filter_distance /
+  filter_blur / custom_effect / primitive_image pipelines) showed the icons drawn right on the GPU (FaceTime, Settings
+  glyphs) and the user saw no yellow squares - so autoarm no longer denies iconservicesagent (it removes b190's
+  "- iconservicesagent" once and clears the icon cache); /Library/GPUBundles/nvmtl-iconcpu forces the CPU fallback.
+  nmx-icontest.sh off only stops the capture. nmx-speed.sh detects the quiet build with grep -a (strings needs the
+  developer tools, not installed on Tahoe).
+  b194 (10-27): b193 was wrong - the user's screen recording shows whole app icons (Activity Monitor, Photo Booth,
+  Siri, Weather...) and the Settings glyphs as solid yellow squares with iconservicesagent on the GPU, although the
+  captured render passes looked right (the capture reads our own image, not what the consumer sees). Default back to
+  iconservicesagent off the GPU; nvmtl-icongpu opts in. Next lead: the hand-off of the finished icon (IOSurface /
+  shared texture) from iconservicesagent to the app, not the drawing.
+  Open (10-27, Tahoe only): at the hand-over the boot logo is redrawn once at ~(0.75, 0.7) of the screen, smaller,
+  without the progress bar - as if centred in a ~3840x2400 screen (1.5x the 2560x1600 panel). Not our snapshot paint
+  (-nmxnosnap is set) and not -nmxconsole. Lead: a size / scale property of NMXGPUFB that Tahoe reads differently from
+  Sequoia; compare `ioreg -lw0 -c NMXGPUFB` on both. Cosmetic (~1 s).
+  Tahoe logo shift: NMXGPUFB properties identical on both systems except the saved desktop mode (Sequoia 1600x1000,
+  Tahoe 1680x1050); the user set Tahoe to 1600x1000 - the logo still jumps, so not the scaled mode. Parked (cosmetic).
+  b195 (S3): the icon test also captures compute passes (every texture bound to a compute encoder, read back after
+  the command buffer: comp-NNN-<fn>-t<i>-fmtF-WxH.raw) and logs every texture -getBytes in iconservicesagent
+  ("NVMTL ICONTEST getBytes") - b191 saw correct render passes, so the yellow must come later: Core Image compute
+  kernels or the CPU readback of the finished icon.
+  b195 capture (10-27): 160 compute captures + 120 passes - all folder / document icons, all drawn right (no yellow);
+  the 160 slots were used up by 16x16 glyphs. getBytes readbacks: 16x16 / 128x128 RGBA8 and 130x130 / 34x34
+  RGB10A2 (fmt 90). b196: compute captures only >= 64 px, and every getBytes >= 64 px is saved (get-NNN-fmtF-WxH.raw)
+  - the finished icon as the CPU receives it.
+  b196 capture (10-28): 163 getBytes saved - 152 are 130x130 RGB10A2 maps (normal-map-like rainbow images of icon
+  shapes); their flat areas read (R 1.0, G 0.5, B 0.5) where a normal map would hold (0.5, 0.5, 1.0) - red and blue
+  look swapped. b197 experiment: /Library/GPUBundles/nvmtl-iconswap makes iconservicesagent store RGB10A2 as BGR10A2.
+  b198 (boot speed + Tahoe logo jump, 10-28): nmx-boottime on Tahoe - WindowServer starts at 2.3 s (before NMXGPU at
+  5.6 s, so a WindowServer restart stays necessary), opens our screen at 9.9 s, armed 12.8 s, restarted 14.7 s, helper
+  signal 16.3 s, hand-over 20.4 s "no new frame in 4 s": the accelerated WindowServer's frames come by copy-forward,
+  not flip_commit, so the go-on-flip wait always ran out. Wait 2 s now. The logo jump: hand-over output 1600x1000 on the
+  2560x1600 panel (scaled desktop) showing buffer 0 = the first WindowServer's native-layout logo through the panel
+  fitter -> logo at ~(0.8, 0.8). bridge_go clears buffer 0 (write only) when the desktop is scaled and no newer frame
+  exists. Note: Tahoe's desktop runs a scaled 1x mode (1600x1000 / 1680x1050), not a 2x HiDPI one - check sharpness.
+  b198 confirmed (10-28): the Tahoe boot logo no longer jumps.
+  b197 swap test (10-28): no change - still yellow. Pattern in the screenshot: the icon BACKGROUND layers are right
+  (App Store blue tile, Freeform with its scribble faintly visible), the FOREGROUND / glyph layer is a solid yellow
+  fill (Settings glyphs, Preview, Magnifier, Boot Camp; App Store's glyph missing). Yellow = (1,1,0,1): what an RG16F
+  distance-field texture (filter_distance passes) gives when sampled as colour with R,G >= 1 - suspect a wrong texture
+  binding or a wrong format for the glyph layer's composite pass. b199: render-pass capture limited to >= 64 px (300).
+  b199 capture (10-28): FOUND the yellow pass - pass 208/227 (132x132 RGBA16F) drawn by primitive_image_fragment alone
+  comes out (1,1,0,1) everywhere; the icon's chain continues with it (yellow 160x160 BGRA blur passes, yellow 128x128
+  squircle = the glyph layer). The image drawn there reads yellow everywhere - like a RG16F distance field (the
+  filter_distance passes right before it) instead of the glyph picture: a wrong texture reaching the shader. Bindless
+  heap lookups are keyed by the VkImageView pointer (nvmtl_bl_slot) - a reused view address could map to a stale slot.
+  b200 experiment: /Library/GPUBundles/nvmtl-iconnobindless turns bindless off in iconservicesagent only.
+  b200 no-bindless test (10-28): iconservicesagent then draws nothing ("?" placeholders) - inconclusive, reverted.
+  b201 (10-28): ROOT CAUSE candidate - MTLHeap placed textures (nvmtlPlacedTexture, new and recycled) never applied
+  the descriptor swizzle; every other creation path calls nvmtl_texture_desc_swizzle. A luminance+alpha glyph layer
+  made on a heap with swizzle (L,L,L,A) sampled as (L,A,0,1) = (1,1,0,1) for a white glyph: the yellow squares.
+  Fixed for every app (also Sequoia). Test: /Library/GPUBundles/nvmtl-icongpu puts iconservicesagent on the GPU.
+  b201 test (10-28): still yellow. b202 icon test logs every texture creation in iconservicesagent (format, size,
+  descriptor swizzle, heap-placed / IOSurface) and every gpuResourceID lookup (format, swizzle state) - to see which
+  texture the yellow pass samples and whether it carries a swizzle we drop.
+  Icons on the GPU PARKED by the user (10-28): iconservicesagent stays off the GPU (CPU icons, correct). Open lead: the symbol layer's shape mask reads fully covered (Default/Dark yellow, Tinted blue, Clear white squares); b202 capture logs texture formats/swizzles when resumed.
+  b203 (10-28): IrisXe Manager - manager/IrisXeManager.swift (SwiftUI window) + manager/irisxe-manager.sh (status,
+  scan, install, repair, armnow; installs with backups) + manager/build.sh; CI puts "IrisXe Manager.app" in out/.
+  b204: app icon options manager/icons/icon-A/B/C.png (original drawings: a chip with an arrow), chosen by manager/icons/CHOSEN; build.sh makes AppIcon.icns.
+  b205: manager status: an ARM/RESTART step while nmx-autoarm.sh is still running (its 60 s check after the WindowServer restart) is shown as "none yet - acceleration check running", not ACCELERATION LOCKED.

@@ -235,6 +235,7 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void);
 } @end
 @interface NVMTLTexture () { @public NSString *_label; MTLResourceOptions _ropt; BOOL _shareable; BOOL _fbo;
   MTLTextureSwizzleChannels _swz; BOOL _hasSwz; void *_swzView;
+  BOOL _lum;   /* b188: luminance (LA08/L008) data read as R,R,R,G / R,R,R,1 */
   void *_tbView, *_tbAlias; BOOL _tbStorage;
   int _resRefs;
   int _nviews;

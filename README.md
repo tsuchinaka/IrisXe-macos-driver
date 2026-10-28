@@ -1,7 +1,7 @@
 # Intel Iris Xe graphics driver for macOS (experimental)
 
 An experimental GPU driver that gives an 11th-gen **Intel Iris Xe (Tiger Lake, `8086:9A49`)** a working display and
-**Metal acceleration on macOS Sequoia** (Hackintosh / OpenCore, x86_64). macOS has never supported this GPU: Apple's
+**Metal acceleration on macOS Sequoia and Tahoe** (Hackintosh / OpenCore, x86_64). macOS has never supported this GPU: Apple's
 last Intel graphics drivers stop at Ice Lake.
 
 It is built on Intel's own open-source Linux display driver (**i915**, through FreeBSD's `drm-kmod`) running inside the
@@ -15,21 +15,18 @@ kernel-port design, the Metal plugin and the shader translator come from NullMot
 > **Experimental.** It runs daily on one machine (below), but it is a kernel driver for the GPU that drives your
 > screen. A bad build can leave the screen black or panic the Mac. Keep a way back (see [Safety](#safety)).
 
-
-
-Support me on [meacoffee.com/zep245](https://buymeacoffee.com/zep245)
-
-
-
 ## Tested machine
 
 | | |
 |---|---|
-| Laptop | Xiaomi Mi Notebook Pro, Core i5-11300H, Iris Xe `8086:9A49`, 1920x1080 eDP panel |
-| macOS | Sequoia 15.8.1, SMBIOS `MacBookPro16,2`, OpenCore |
+| Laptop | Xiaomi Mi Notebook Pro, Core i5-11300H, Iris Xe `8086:9A49`, 2560x1600 eDP panel |
+| macOS | Sequoia 15.8.1 and Tahoe 26.7.1 (same laptop, two volumes), SMBIOS `MacBookPro16,2`, OpenCore |
 | Desktop | 1680x1050 (scaled), accelerated |
 
-Other Tiger Lake Iris Xe / UHD laptops may work; nothing else has been tested. Tahoe (macOS 26) is planned.
+Other Tiger Lake Iris Xe / UHD laptops may work; nothing else has been tested.
+
+Sequoia and Tahoe use the same display driver, display helper and Metal plugin. Only the accelerator differs:
+the artifact's `out/NMXAccel.kext` is for Sequoia, `out/tahoe/NMXAccel.kext` for Tahoe (IrisXe Manager picks the right one).
 
 ## What works
 
@@ -54,6 +51,13 @@ Measured on the tested machine, idle desktop on battery at 11 % brightness: abou
   restarted once, accelerated, because the driver loads after it starts.
 - External displays (HDMI / USB-C): mirroring of the laptop screen only, not yet tested on hardware; no extended desktop.
 - A Metal app that is not on the allow-list gets no GPU device.
+- **Tahoe:** app and settings icons are drawn by the CPU (`- iconservicesagent` in the allow-list, added by the
+  acceleration helper). On the GPU, Tahoe's icon renderer fills the symbol as a solid square in the style colour
+  (yellow / blue / white); not fixed yet. Icons therefore appear slowly the first time and the CPU works harder.
+- **Tahoe is slower and warmer than Sequoia** on the same laptop: the Liquid Glass interface needs much more GPU work
+  per frame, icons are drawn on the CPU (above), and a new install indexes for days. System Settings -> Accessibility ->
+  Display -> **Reduce transparency** removes most of the glass work.
+- Tahoe's desktop is scaled 1x (not HiDPI) on the tested panel.
 
 ## Architecture
 
@@ -103,6 +107,21 @@ Pinned upstream versions (bumping them means fixing the port):
 
 ## Installing
 
+**IrisXe Manager** (`manager/`, built into the artifact as `out/IrisXe Manager.app`) does the steps below from a window:
+pick the unzipped build folder, tick the parts (display driver, accelerator - the right one for the running macOS is
+picked -, display helper, Metal plugin update or full plugin, shader translator, acceleration at every boot) and press
+Install; the old files are kept in `/Library/Application Support/IrisXe/backup/`. "Clear Safety Locks" removes the
+NVRAM guards after a hang, "Turn Acceleration On Now" arms without a restart. The same actions by hand:
+`manager/irisxe-manager.sh status | scan <folder> | install <folder> <parts> | repair | armnow`.
+
+The app is not signed by a registered Apple developer, so macOS warns the first time. Copy it to Applications, then:
+`xattr -dr com.apple.quarantine "/Applications/IrisXe Manager.app"`. In the first minute after login the "locks" line
+reads "acceleration check running" - the helper is still watching the restarted WindowServer; that is not a lock.
+
+The artifact's `out/NVMTLDriver.bundle` is the **quiet** plugin (logs failures only, less CPU); `out/debug/NVMTLDriver.bundle`
+is the verbose one, for diagnosing a problem.
+
+
 Requirements: OpenCore with SIP reduced and `SecureBootModel Disabled` (the kexts are unsigned), the Intel Tiger Lake
 firmware (`i915/tgl_dmc_*`, `tgl_guc_*`, `tgl_huc_*`, see `app/Resources/nullmoth-gpu-firmware.txt`) in
 `/Library/NullMoth/firmware/i915/`.
@@ -136,6 +155,7 @@ Boot-args (OpenCore `boot-args`):
 | `-nmxnohold` / `-nmxnodefer` | Do not hold the Apple logo until the accelerated desktop / commit the screen at once |
 | `nmxgtawake=2` | Keep the GPU out of RC6 |
 | `nmxautoarm=2` / `3` | Acceleration helper: dry run / arm without restarting WindowServer |
+| `nmxsagv=1` | Let i915 control SAGV / memory clock points (off by default: its firmware request hung the boot on Tahoe) |
 
 Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 
@@ -145,6 +165,9 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nvmtl-ciflip` | Apps whose Core Image output is flipped (default: Photo Booth; an empty file turns it off) |
 | `nvmtl-standincopy` | Old copy mode for small image uploads (causes stale text - diagnostic only) |
 | `nmx-autoarm-slow` / `nmx-autoarm-fast` | Slower / faster acceleration helper timings |
+| `nvmtl-icongpu` | Tahoe: let iconservicesagent use the GPU (icons draw wrong - test only) |
+| `nvmtl-icontest` | Tahoe: icon test mode with captures (use `nmx-icontest.sh`) |
+| `nvmtl-nolumswizzle` | Turn off the luminance swizzle for one-channel (LA08 / L008) surfaces |
 
 ## Diagnostics
 
@@ -155,6 +178,8 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nmx-wakecheck.sh` | What happened in the last sleeps and wakes |
 | `nmx-display.sh` | Outputs the driver sees (panel, HDMI, DisplayPort), their modes, hot-plug events |
 | `nmx-autoarm/nmx-autoarm-report.sh` | The acceleration helper's last boot |
+| `nmx-speed.sh` | CPU time of WindowServer, logd, iconservicesagent and others over a minute, driver log lines, quiet / verbose plugin |
+| `nmx-icontest.sh` | Tahoe icon test: `on`, `collect`, `off` |
 
 Driver log: `log show --last boot --predicate 'eventMessage contains "NullMoth"'`.
 

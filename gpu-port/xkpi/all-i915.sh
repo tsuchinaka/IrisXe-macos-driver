@@ -54,6 +54,12 @@ if [ -n "$GD" ]; then
 else
     echo "ERROR: display/intel_display.c not found"; exit 1
 fi
+GW=$(find "$K/drm-kmod" -path '*i915/display/skl_watermark.c' | head -1)
+if [ -n "$GW" ]; then
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_nosagv.py "$GW" || { echo "ERROR: SAGV patch failed"; exit 1; }
+else
+    echo "ERROR: display/skl_watermark.c not found"; exit 1
+fi
 GI=$(find "$K/drm-kmod" -path '*i915/display/intel_plane_initial.c' | head -1)
 if [ -n "$GI" ]; then
     ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_initial_fb.py "$GI" || { echo "ERROR: initial framebuffer patch failed"; exit 1; }

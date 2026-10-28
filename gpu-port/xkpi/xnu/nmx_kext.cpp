@@ -314,6 +314,18 @@ extern "C" void nmx_step(const char *what)
 /* read-only snapshot of the display engine (eDP panel power, backlight, pipe A, plane 1, DDI A, power wells) for black-screen
    diagnosis; reads only, safe at any time the device is powered */
 extern "C" unsigned long __drm_debug;
+/* b192: i915 controls SAGV / QGV points (PCODE requests at every bandwidth change) only with boot-arg nmxsagv=1.
+   Off by default since Tahoe hung inside "commit tail: SAGV post-plane" on every boot (10-27); see patch_i915_nosagv.py */
+extern "C" int nmx_sagv_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        int a = 0;
+        v = (PE_parse_boot_argn("nmxsagv", &a, sizeof(a)) && a != 0) ? 1 : 0;
+        IOLog("NullMoth GPU: SAGV / QGV control by i915 %s (boot-arg nmxsagv=1 turns it on)\n", v ? "ON" : "OFF");
+    }
+    return v;
+}
 /* boot-arg nmxnovga=1: i915 leaves the legacy VGA plane alone (see patch_i915_novga.py) */
 extern "C" int nmx_novga(void)
 {

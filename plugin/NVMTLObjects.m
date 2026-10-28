@@ -994,6 +994,9 @@ static int nvmtl_trace_on(void) {
         on = access("/tmp/nvmtl-trace-request", F_OK) == 0 || access(home_req, F_OK) == 0;
         /* b161: WindowServer alone, with /Library/GPUBundles/nvmtl-wstrace (its file goes next to nvmtl-ws.log) */
         if (!on && getprogname() && !strcmp(getprogname(), "WindowServer")) on = access("/Library/GPUBundles/nvmtl-wstrace", F_OK) == 0;
+        /* b191 (docs/SPEEDUP.md S3): iconservicesagent alone, with /Library/GPUBundles/nvmtl-icontrace - its sandbox hides
+           /tmp and HOME, so the file goes to its own temp folder (see the open below) */
+        if (!on && getprogname() && !strcmp(getprogname(), "iconservicesagent")) on = access("/Library/GPUBundles/nvmtl-icontrace", F_OK) == 0;
         if (on && !was) nvlog("G15 trace: ON (request file seen) - writing %s/nvmtl-trace-%d.txt", getenv("HOME") ?: "/tmp", (int)getpid());
         g_trace_bigonly = on && access("/tmp/nvmtl-trace-big", F_OK) == 0; if (!g_trace_bigonly) g_trace_mute = 0;
         if (on && !was) { g_trace_lines = 0; cap = access("/tmp/nvmtl-trace-long", F_OK) == 0 ? 20000 : 2500;
@@ -1017,6 +1020,9 @@ static void nvtrace(const char *fmt, ...) {
         extern const char *nvmtl_log_path(void); const char *lp = nvmtl_log_path(); const char *sl = strrchr(lp, '/');
         int n = sl ? (int)(sl - lp) : 0; snprintf(p, sizeof p, "%.*s/nvmtl-trace-%d.txt", n, lp, (int)getpid()); }
     int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) {   /* b191: a sandboxed process (iconservicesagent) can write only its own temp folder */
+        char td[512]; size_t tn = confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td);
+        if (tn > 0 && tn <= sizeof td) { snprintf(p, sizeof p, "%snvmtl-trace-%d.txt", td, (int)getpid()); fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600); } }
     if (fd < 0) { static int said; if (!said++) nvlog("G15 trace: cannot open %s (errno %d)", p, errno); return; }
     char b[700]; int pre = ws ? snprintf(b, 32, "t%llu ", (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull)) : 0;
     if (pre < 0 || pre > 31) pre = 0;
@@ -1232,6 +1238,7 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (cb && r->_surf && [cb->_surfOverwrites containsObject:r]) return;
     [t nvmtlSurfaceIn];
 }
+static void nvmtl_icontest_getbytes(NVMTLTexture *t, const void *bytes, NSUInteger row, MTLRegion r);   /* b195, defined with the icon test */
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
 static int nvmtl_noseed(void) { static uint64_t next; static int on; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-noseed", F_OK) == 0;
@@ -1331,9 +1338,86 @@ extern int nvmtl_depthfmt_public(MTLPixelFormat, uint32_t *, uint32_t *);
 /* MTLTextureDescriptor.swizzle applies when the texture is sampled or read, not to attachments or shader writes, so it
  * gets a view of its own for the sampled binds and the identity view stays for everything else. IconServices hands
  * gray + alpha image layers over as RG8 with swizzle (r, r, r, g); with the swizzle dropped, alpha landed in green. */
+/* b188 (Tahoe yellow icons, 10-26): b187 gave the 'LA08' IOSurface texture its L,L,L,A swizzle but the icons stayed
+   yellow, so WindowServer reads those pixels through something else: a view of the texture, or a copy into its own
+   RG8 texture (a cache). The luminance reading now follows the data: views of a luminance texture and textures a
+   luminance texture is blitted into get the same swizzle. Each case is logged ("NVMTL LUMSWZ ... via <why>"). */
+int nvmtl_texture_lum_apply(NVMTLTexture *t, const char *why) {
+    if (!t) return 0;
+    if (t->_lum) return 1;
+    if (t->_hasSwz || t->_tbView) return 0;
+    static int lumOn = -1;
+    if (lumOn < 0) lumOn = access("/Library/GPUBundles/nvmtl-nolumswizzle", F_OK) != 0;
+    if (!lumOn) return 0;
+    const MTLPixelFormat pf = (MTLPixelFormat)t->_fmt;
+    const int rg = (pf == MTLPixelFormatRG8Unorm || pf == MTLPixelFormatRG16Unorm || pf == MTLPixelFormatRG16Float);
+    const int r1 = (pf == MTLPixelFormatR8Unorm || pf == MTLPixelFormatR16Unorm || pf == MTLPixelFormatR16Float);
+    if (!rg && !r1) return 0;
+    extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
+    uint32_t vkf = 0, bpp = 0; int a8 = 0; void *nv = NULL;
+    const uint8_t s4[4] = { (uint8_t)MTLTextureSwizzleRed, (uint8_t)MTLTextureSwizzleRed, (uint8_t)MTLTextureSwizzleRed,
+                            (uint8_t)(rg ? MTLTextureSwizzleGreen : MTLTextureSwizzleOne) };
+    const int isView = t->_parent != nil;
+    if (nvmtl_pixfmt_public(pf, &vkf, &bpp, &a8) ||
+        nvmtl_vk_image_view_create_range_swz([t nvi], vkf, a8, isView ? t->_baseLevel : 0, isView ? t->_mips : 0,
+                                             isView ? t->_baseSlice : 0, isView ? t->_viewSlices : 0,
+                                             isView ? t->_viewType : [t nvi]->mtl_type, s4, &nv) || !nv) {
+        syslog(LOG_NOTICE, "NVMTL LUMSWZ %s: via %s - swizzled view NOT made (format %lu)", getprogname(), why, (unsigned long)pf);
+        return 0; }
+    if (t->_swzView) nvmtl_vk_image_view_destroy(t->_swzView);
+    t->_swzView = nv; t->_lum = YES; t->_hasSwz = YES;
+    t->_swz = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed,
+                                            rg ? MTLTextureSwizzleGreen : MTLTextureSwizzleOne);
+    static int said;
+    if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 12)
+        syslog(LOG_NOTICE, "NVMTL LUMSWZ %s: via %s - %p format %lu %ux%u reads R,R,R,%s", getprogname(), why, (__bridge void *)t,
+               (unsigned long)pf, [t nvi]->w, [t nvi]->h, rg ? "G" : "1");
+    return 1;
+}
+static inline int nvmtl_tex_is_lum(NVMTLTexture *t) {
+    return t && (t->_lum || (t->_viewParent && ((NVMTLTexture *)t->_viewParent)->_lum) || (t->_parent && t->_parent->_lum)); }
+/* b189 diagnostic: b188 showed the 'LA08' texture IS sampled through the swizzled view, yet the System Settings
+   glyphs are solid yellow squares (the coloured icon tile is right). So: what is in the surface, and which shader
+   and blend draw it. For the first binds per process: alpha / luminance statistics of the IOSurface (read-only lock,
+   ordinary IOSurface memory), a 20x10 picture of its alpha, the fragment function, the blend, the target format. */
+static void nvmtl_lum_bind_note(NVMTLTexture *t, const char *stage, NSString *fn, NSString *blend, unsigned passFmt) {
+    if (!t || !nvmtl_tex_is_lum(t)) return;
+    static int said;
+    const int k = __atomic_fetch_add(&said, 1, __ATOMIC_RELAXED);
+    if (k >= 8) return;
+    NVMTLTexture *r = t->_parent ? t->_parent : (t->_viewParent ? t->_viewParent : t);
+    syslog(LOG_NOTICE, "NVMTL LUMSWZ %s: luminance texture %p bound for %s sampling (%s view) fn %s blend %s target fmt %u", getprogname(),
+           (__bridge void *)t, stage, t->_swzView ? "swizzled" : "PLAIN", fn ? fn.UTF8String : "-", blend ? blend.UTF8String : "-", passFmt);
+    IOSurfaceRef sf = r->_surf;
+    if (k >= 4 || !sf || IOSurfaceGetBytesPerElement(sf) != 2 || IOSurfaceGetPlaneCount(sf) > 1) return;
+    if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
+    const uint8_t *b = (const uint8_t *)IOSurfaceGetBaseAddress(sf);
+    const size_t row = IOSurfaceGetBytesPerRow(sf), w = IOSurfaceGetWidth(sf), h = IOSurfaceGetHeight(sf);
+    unsigned long n = 0, l0 = 0, a0 = 0, lfull = 0, afull = 0, lgta = 0; unsigned lmax = 0, amax = 0;
+    char pic[10][21]; memset(pic, 0, sizeof pic);
+    for (size_t y = 0; b && y < h; y++) for (size_t x = 0; x < w; x++) {
+        const uint8_t L = b[y * row + x * 2], A = b[y * row + x * 2 + 1];
+        n++; l0 += L != 0; a0 += A != 0; lfull += L == 255; afull += A == 255; lgta += L > A;
+        if (L > lmax) lmax = L; if (A > amax) amax = A;
+    }
+    for (int py = 0; b && py < 10; py++) { for (int px = 0; px < 20; px++) {
+        const uint8_t A = b[(py * h / 10 + h / 20) * row + (px * w / 20 + w / 40) * 2 + 1];
+        pic[py][px] = A > 192 ? '#' : A > 96 ? '+' : A > 16 ? '.' : '_'; } }
+    IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+    syslog(LOG_NOTICE, "NVMTL LUMDATA %s: %zux%zu row %zu: L>0 %lu, A>0 %lu, L=255 %lu, A=255 %lu, L>A %lu of %lu; max L %u A %u",
+           getprogname(), w, h, row, l0, a0, lfull, afull, lgta, n, lmax, amax);
+    syslog(LOG_NOTICE, "NVMTL LUMDATA %s: alpha %s|%s|%s|%s|%s|%s|%s|%s|%s|%s", getprogname(),
+           pic[0], pic[1], pic[2], pic[3], pic[4], pic[5], pic[6], pic[7], pic[8], pic[9]);
+}
+static int nvmtl_icontest_on(void);
 void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (!t || !d || ![d respondsToSelector:@selector(swizzle)]) return;
     const MTLTextureSwizzleChannels sw = d.swizzle;
+    /* b202 icon test: every texture creation in iconservicesagent - format, size, swizzle, heap-placed or not */
+    if (nvmtl_icontest_on()) { static int n; if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 400)
+        syslog(LOG_NOTICE, "NVMTL ICONTEST tex: %p %lux%lu fmt %lu usage 0x%lx storage %lu swizzle %u%u%u%u%s%s", (__bridge void *)t,
+               (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)d.usage,
+               (unsigned long)d.storageMode, sw.red, sw.green, sw.blue, sw.alpha, t->_subPlaced ? " HEAP-PLACED" : "", t->_surf ? " IOSURFACE" : ""); }
     if (sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen && sw.blue == MTLTextureSwizzleBlue && sw.alpha == MTLTextureSwizzleAlpha) return;
     t->_swz = sw; t->_hasSwz = YES;
     if (d.textureType == MTLTextureTypeTextureBuffer || d.sampleCount > 1 || t->_tbView) {
@@ -1549,6 +1633,7 @@ static unsigned long long g_surfin_verify;
     if (nvmtl_vk_image_read_region_level_layer(_q, [self nvi], (uint8_t *)bytes, row, (uint32_t)region.origin.x, (uint32_t)region.origin.y,
                                                (uint32_t)region.size.width, (uint32_t)region.size.height, (uint32_t)level + _baseLevel, _baseSlice))
         nvlog("texture getBytes: readback FAILED");
+    else nvmtl_icontest_getbytes(self, bytes, row, region);
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)img
       fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
@@ -1627,6 +1712,7 @@ static unsigned long long g_surfin_verify;
         nvlog("newTextureView: view create FAILED"); return nil;
     }
     v->_stex = [v nvi]->storage && !a8 && nvmtl_vk_format_is_storage(vkf);
+    if (_lum || (_parent && _parent->_lum)) nvmtl_texture_lum_apply(v, "texture view");
     return v;
 }
 int nvmtl_vk_cmd_attachment_view_fmt(nvk_cmdbuf *c, nvk_image *img, int depth, uint32_t level, uint32_t slice, uint32_t vkfmt, int a8,
@@ -1669,6 +1755,7 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
     uint32_t nslices = (uint32_t)slices.length;
     if (nvmtl_vk_image_view_create_range([v nvi], vkf, a8, v->_baseLevel, v->_mips, v->_baseSlice, nslices, (uint32_t)tt, &v->_ownView)) { nvlog("newTextureView: typed view FAILED"); return nil; }
     v->_stex = [v nvi]->storage && !a8 && nvmtl_vk_format_is_storage(vkf);
+    if (_lum || (_parent && _parent->_lum)) nvmtl_texture_lum_apply(v, "texture view");
     return v;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)f textureType:(MTLTextureType)tt
@@ -1683,6 +1770,7 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
         nvmtl_vk_image_view_create_range_swz([v nvi], vkf, a8, v->_baseLevel, v->_mips, v->_baseSlice, v->_viewSlices, v->_viewType, s4, &nv)) {
         nvlog("newTextureView:swizzle: par1 the swizzled view could not be built (format %lu) — the view keeps the identity mapping", (unsigned long)f);
         return v; }
+    if (v->_swzView) { nvmtl_vk_image_view_destroy(v->_swzView); v->_swzView = NULL; v->_lum = NO; }
     if (v->_ownView) nvmtl_vk_image_view_destroy(v->_ownView);
     v->_ownView = nv; v->_stex = NO;
     v->_swz = sw; v->_hasSwz = YES;
@@ -2737,6 +2825,120 @@ static void nvmtl_sample_counter(NVMTLCommandBuffer *cb, id sb, NSUInteger i, id
 }
 
 unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1_ds_resolve_miss;
+/* b191 icon test (docs/SPEEDUP.md S3): Tahoe's icon renderer (iconservicesagent / IconRendering) drew glyphs as solid
+   yellow squares on our device. With /Library/GPUBundles/nvmtl-icontest present and iconservicesagent allowed, every
+   small render pass (<= 512x512, first 120 per process) is read back after its command buffer completes and saved
+   with the fragment functions it used: <user cache dir>/nvmtl-icontest/pass-NNN-fmtF-WxH.raw (header "NVIT", w, h,
+   row bytes, Metal format, then the pixels) + a syslog line "NVMTL ICONTEST". Compare with the CPU-drawn icon to see
+   which pass first goes wrong. Off when the file is absent (checked once per process). */
+static int nvmtl_icontest_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *me = getprogname();
+        on = me && !strcmp(me, "iconservicesagent") && access("/Library/GPUBundles/nvmtl-icontest", F_OK) == 0;
+        if (on) syslog(LOG_NOTICE, "NVMTL ICONTEST %s: ON - small render passes are saved", me); }
+    return on;
+}
+static char nvmtl_icontest_key;
+static void nvmtl_icontest_note_pipeline(id enc, NVMTLRenderPipelineState *ps) {
+    if (!ps || !nvmtl_icontest_on()) return;
+    NSMutableArray *a = objc_getAssociatedObject(enc, &nvmtl_icontest_key);
+    if (!a) { a = [NSMutableArray new]; objc_setAssociatedObject(enc, &nvmtl_icontest_key, a, OBJC_ASSOCIATION_RETAIN); }
+    NSString *n = [NSString stringWithFormat:@"%@/%@%@", ps->_vname ?: @"-", ps->_fname ?: @"-", [ps->_blend hasPrefix:@"1"] ? @"+blend" : @""];
+    if (a.count < 10 && ![a containsObject:n]) [a addObject:n];
+}
+static void nvmtl_icontest_pass_end(id enc, NVMTLCommandBuffer *cb, NVMTLTexture *target) {
+    if (!target || !cb || !nvmtl_icontest_on()) return;
+    nvk_image *im = [target nvi];
+    /* b199: icon-sized passes only (>= 64 px), up to 300 - b191..b196 filled the 120 slots with 16-32 px glyphs */
+    if (!im || !im->img || im->w > 512 || im->h > 512 || im->w < 64 || im->h < 64 || (im->bpp != 1 && im->bpp != 2 && im->bpp != 4 && im->bpp != 8)) return;
+    static int npass;
+    const int k = __atomic_fetch_add(&npass, 1, __ATOMIC_RELAXED);
+    if (k >= 300) return;
+    NSArray *fns = [objc_getAssociatedObject(enc, &nvmtl_icontest_key) copy] ?: @[];
+    NVMTLTexture *t = target; const unsigned long mf = (unsigned long)target->_fmt;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        nvk_image *i = [t nvi]; const size_t row = (size_t)i->w * i->bpp; void *px = malloc(row * i->h);
+        if (!px) return;
+        const int bad = nvmtl_vk_image_read(t->_q, i, px, row);
+        char dir[900]; size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, dir, sizeof dir);
+        if (!n || n > sizeof dir) snprintf(dir, sizeof dir, "/tmp/");
+        char path[1100]; snprintf(path, sizeof path, "%snvmtl-icontest", dir); mkdir(path, 0755);
+        snprintf(path, sizeof path, "%snvmtl-icontest/pass-%03d-fmt%lu-%ux%u.raw", dir, k, mf, i->w, i->h);
+        if (!bad) { FILE *f = fopen(path, "wb");
+            if (f) { uint32_t hdr[5] = { 0x5449564e, i->w, i->h, (uint32_t)row, (uint32_t)mf }; fwrite(hdr, sizeof hdr, 1, f); fwrite(px, row, i->h, f); fclose(f); } }
+        const uint8_t *c = (const uint8_t *)px + (size_t)(i->h / 2) * row + (size_t)(i->w / 2) * i->bpp;
+        char hex[40] = ""; for (uint32_t q = 0; q < i->bpp && !bad; q++) snprintf(hex + q * 2, 3, "%02x", c[q]);
+        syslog(LOG_NOTICE, "NVMTL ICONTEST pass %d: %ux%u fmt %lu centre %s%s cb-status %ld fns %s", k, i->w, i->h, mf,
+               bad ? "(read FAILED)" : hex, "", (long)b.status, [[fns componentsJoinedByString:@" | "] UTF8String]);
+        free(px);
+    }];
+}
+
+/* b195 icon test: b191 captured only render passes, and those looked right - yet the icons arrive yellow. Core Image
+   finishes the icon in COMPUTE kernels (ci_*) and the result reaches the CPU through -getBytes, so both are captured
+   too: every texture bound to a compute encoder (<= 512x512) is read back after its command buffer, saved as
+   comp-NNN-<function>-fmtF-WxH.raw, and every -getBytes in iconservicesagent logs its region, format and first bytes
+   ("NVMTL ICONTEST getBytes"). */
+static char nvmtl_icontest_ckey;
+static void nvmtl_icontest_note_compute_tex(id enc, NVMTLComputePipelineState *ps, NVMTLTexture *t, NSUInteger idx) {
+    if (!t || !nvmtl_icontest_on()) return;
+    NSMutableArray *a = objc_getAssociatedObject(enc, &nvmtl_icontest_ckey);
+    if (!a) { a = [NSMutableArray new]; objc_setAssociatedObject(enc, &nvmtl_icontest_ckey, a, OBJC_ASSOCIATION_RETAIN); }
+    for (NSArray *e in a) if (e[0] == t) return;
+    if (a.count < 8) [a addObject:@[ t, (ps && ps->_function && ps->_function->_fname) ? ps->_function->_fname : @"-", @(idx) ]];
+}
+static void nvmtl_icontest_compute_end(id enc, NVMTLCommandBuffer *cb) {
+    if (!cb || !nvmtl_icontest_on()) return;
+    NSArray *a = [objc_getAssociatedObject(enc, &nvmtl_icontest_ckey) copy];
+    if (!a.count) return;
+    static int ncomp;
+    for (NSArray *e in a) {
+        NVMTLTexture *t = e[0]; NSString *fn = e[1]; const unsigned idx = [e[2] unsignedIntValue];
+        nvk_image *im = [t nvi];
+        /* b196: only icon-sized textures (>= 64 px) - the 160 slots went to 16x16 folder glyphs in b195 */
+        if (!im || !im->img || im->w > 512 || im->h > 512 || im->w < 64 || im->h < 64 || (im->bpp != 1 && im->bpp != 2 && im->bpp != 4 && im->bpp != 8)) continue;
+        const int k = __atomic_fetch_add(&ncomp, 1, __ATOMIC_RELAXED);
+        if (k >= 160) return;
+        const unsigned long mf = (unsigned long)t->_fmt;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+            nvk_image *i = [t nvi]; const size_t row = (size_t)i->w * i->bpp; void *px = malloc(row * i->h);
+            if (!px) return;
+            const int bad = nvmtl_vk_image_read(t->_q, i, px, row);
+            char dir[900]; size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, dir, sizeof dir);
+            if (!n || n > sizeof dir) snprintf(dir, sizeof dir, "/tmp/");
+            char fnc[48]; snprintf(fnc, sizeof fnc, "%s", fn.UTF8String); for (char *c = fnc; *c; c++) if (*c == '/' || *c == ' ') *c = '_';
+            char path[1100]; snprintf(path, sizeof path, "%snvmtl-icontest", dir); mkdir(path, 0755);
+            snprintf(path, sizeof path, "%snvmtl-icontest/comp-%03d-%s-t%u-fmt%lu-%ux%u.raw", dir, k, fnc, idx, mf, i->w, i->h);
+            if (!bad) { FILE *f = fopen(path, "wb");
+                if (f) { uint32_t hdr[5] = { 0x5449564e, i->w, i->h, (uint32_t)row, (uint32_t)mf }; fwrite(hdr, sizeof hdr, 1, f); fwrite(px, row, i->h, f); fclose(f); } }
+            const uint8_t *c = (const uint8_t *)px + (size_t)(i->h / 2) * row + (size_t)(i->w / 2) * i->bpp;
+            char hex[40] = ""; for (uint32_t q = 0; q < i->bpp && !bad; q++) snprintf(hex + q * 2, 3, "%02x", c[q]);
+            syslog(LOG_NOTICE, "NVMTL ICONTEST compute %d: %s texture %u %ux%u fmt %lu centre %s", k, fn.UTF8String, idx, i->w, i->h, mf,
+                   bad ? "(read FAILED)" : hex);
+            free(px);
+        }];
+    }
+}
+static void nvmtl_icontest_getbytes(NVMTLTexture *t, const void *bytes, NSUInteger row, MTLRegion r) {
+    if (!t || !bytes || !nvmtl_icontest_on()) return;
+    static int n; const int k = __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED); if (k >= 200) return;
+    const uint8_t *c = (const uint8_t *)bytes + (r.size.height / 2) * row + (r.size.width / 2) * [t nvi]->bpp;
+    /* b196: the bytes handed to the CPU ARE the finished icon - save them (>= 64 px) */
+    if (r.size.width >= 64 && r.size.height >= 64 && r.size.width <= 1024 && r.size.height <= 1024) {
+        char dir[900]; size_t dn = confstr(_CS_DARWIN_USER_CACHE_DIR, dir, sizeof dir);
+        if (!dn || dn > sizeof dir) snprintf(dir, sizeof dir, "/tmp/");
+        char path[1100]; snprintf(path, sizeof path, "%snvmtl-icontest", dir); mkdir(path, 0755);
+        snprintf(path, sizeof path, "%snvmtl-icontest/get-%03d-fmt%lu-%lux%lu.raw", dir, k, (unsigned long)t->_fmt,
+                 (unsigned long)r.size.width, (unsigned long)r.size.height);
+        FILE *f = fopen(path, "wb");
+        if (f) { uint32_t hdr[5] = { 0x5449564e, (uint32_t)r.size.width, (uint32_t)r.size.height, (uint32_t)row, (uint32_t)t->_fmt };
+                 fwrite(hdr, sizeof hdr, 1, f); fwrite(bytes, row, r.size.height, f); fclose(f); }
+    }
+    if (k >= 80) return;
+    char hex[40] = ""; for (uint32_t q = 0; q < [t nvi]->bpp && q < 16; q++) snprintf(hex + q * 2, 3, "%02x", c[q]);
+    syslog(LOG_NOTICE, "NVMTL ICONTEST getBytes: texture %ux%u fmt %lu region %lux%lu row %lu surf %u centre %s", [t nvi]->w, [t nvi]->h,
+           (unsigned long)t->_fmt, (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)row, nvmtl_surf_id(t), hex);
+}
 @implementation NVMTLRenderCommandEncoder
 - (NSUInteger)tileWidth { return 0; }
 - (NSUInteger)tileHeight { return 0; }
@@ -2973,6 +3175,7 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
 }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)ps {
     { NVMTLRenderPipelineState *p_ = (NVMTLRenderPipelineState *)ps;
+      nvmtl_icontest_note_pipeline(self, p_);
       if (p_ && nvmtl_trace_on()) {
           extern int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n);
           uint32_t hv = 0, hf = 0;
@@ -3098,6 +3301,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     nvmtl_surface_in_for_cb(_cb, nt);
     if (nt->_tbView) nvmtl_vk_bind_texel_view(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, nt->_tbView, nt->_tbStorage);
     else {
+    nvmtl_lum_bind_note(nt, "vertex", _ps ? _ps->_vname : nil, nil, _passFmt);
     if (nvmtl_vk_bind_texture_view(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, [nt nvsampleview])) nvlog("setVertexTexture: bind FAILED");
     nvmtl_vk_bind_storage_view(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, nt->_stex ? [nt nvview] : NULL);
     }
@@ -3134,6 +3338,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
         rt->_surf ? (unsigned)IOSurfaceGetID(rt->_surf) : 0u, nt->_parent != nil); }
     if (nt->_tbView) nvmtl_vk_bind_texel_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, nt->_tbView, nt->_tbStorage);
     else {
+    nvmtl_lum_bind_note(nt, "fragment", _ps ? _ps->_fname : nil, _ps ? _ps->_blend : nil, _passFmt);
     if (nvmtl_vk_bind_texture_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, [nt nvsampleview])) nvlog("setFragmentTexture: bind FAILED");
     nvmtl_vk_bind_storage_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, nt->_stex ? [nt nvview] : NULL);
     }
@@ -3270,6 +3475,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     _cb->_nEnd++;
     [self nvmtlCloseVisibility];
     if (_begun) nvmtl_vk_cmd_end_render(&_cb->_c);
+    nvmtl_icontest_pass_end(self, _cb, _target);
     NSMutableDictionary *groups = [NSMutableDictionary new];
     BOOL needScratch = NO;
     for (NSArray *record in _visRecords) {
@@ -3388,6 +3594,9 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)s {
     _ds = (NVMTLDepthStencilState *)s;
+    if (_ds) nvtrace("DSS %p write %d compare %d stencil %d f{%u %u %u %u %x %x} b{%u %u %u %u %x %x}", (__bridge void *)_ds, _ds->_write,
+                     _ds->_compare, _ds->_stencil, _ds->_sf[0], _ds->_sf[1], _ds->_sf[2], _ds->_sf[3], _ds->_sf[4], _ds->_sf[5],
+                     _ds->_sb[0], _ds->_sb[1], _ds->_sb[2], _ds->_sb[3], _ds->_sb[4], _ds->_sb[5]);
     [self nvmtlApplyDepthStencil];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it
@@ -3417,8 +3626,8 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
                   instanceCount:1 baseVertex:0 baseInstance:0];
 }
 
-- (void)setStencilReferenceValue:(uint32_t)ref { nvmtl_vk_cmd_set_stencil_ref(&_cb->_c, ref, ref); _hasRef = YES; }
-- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { nvmtl_vk_cmd_set_stencil_ref(&_cb->_c, f, b); _hasRef = YES; }
+- (void)setStencilReferenceValue:(uint32_t)ref { nvtrace("SREF %u", ref); nvmtl_vk_cmd_set_stencil_ref(&_cb->_c, ref, ref); _hasRef = YES; }
+- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { nvtrace("SREF %u/%u", f, b); nvmtl_vk_cmd_set_stencil_ref(&_cb->_c, f, b); _hasRef = YES; }
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp { nvmtl_vk_cmd_set_depth_bias(&_cb->_c, bias, slope, clamp); }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
     float rgba[4] = { r, g, b, a }; nvmtl_vk_cmd_set_blend_color(&_cb->_c, rgba);
@@ -3894,6 +4103,11 @@ void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared) {
     _used += len;
     atomic_fetch_add(&gHAPlaced, 1); atomic_fetch_add(&gHALive, len);
     atomic_fetch_add(rec ? &gHTRecycled : &gHTPlaced, 1); nvmtl_heaptex_census(rec ? "recycled" : "placed");
+    /* b201 (Tahoe yellow icons, 10-28): heap-placed textures never got their descriptor's SWIZZLE - every other
+       texture creation path calls this. Tahoe's icon renderer makes its glyph layers as heap textures in a two-channel
+       luminance + alpha format with a swizzle (L, L, L, A); without it the white glyph sampled as (L, A, 0, 1) =
+       (1, 1, 0, 1): the solid yellow squares (b199 capture: pass 208, primitive_image_fragment, yellow everywhere). */
+    nvmtl_texture_desc_swizzle(t, d);
     return t;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
@@ -4539,6 +4753,7 @@ static void nvmtl_zprobe_drain(void) {
 - (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
     NVMTLTexture *nt = (NVMTLTexture *)t;
     if (!nt) { nvlog("compute setTexture: nil at %lu", (unsigned long)i); return; }
+    nvmtl_icontest_note_compute_tex(self, _ps, nt, i);
     nvmtl_zprobe_record(nt, _ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL, (unsigned)i, nt->_stex ? 1u : 0u);
     { static int said; if (said < 40 && nvmtl_cidump_fn(_ps)) { said++;
         cilog("CIDUMP   %s texture %lu: %ux%u fmt %lu usage 0x%lx surf %u%s", _ps->_function->_fname.UTF8String, (unsigned long)i,
@@ -4549,6 +4764,7 @@ static void nvmtl_zprobe_drain(void) {
     if (nt->_tbView) nvmtl_vk_bind_texel_view(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, nt->_tbView, nt->_tbStorage);
     else {
     if (nvmtl_vk_cmd_prepare_sampled_image(&_cb->_c, [nt nvi], nt->_stex)) { nvlog("compute setTexture: image layout preparation refused"); return; }
+    nvmtl_lum_bind_note(nt, "compute", nil, nil, 0);
     if (nvmtl_vk_bind_texture_view(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, [nt nvsampleview])) nvlog("compute setTexture: bind FAILED");
     nvmtl_vk_bind_storage_view(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, nvmtl_storage_view_for(_cb, nt, nt->_stex || nvmtl_function_writes_texture(_ps ? _ps->_function : nil, i)));
     }
@@ -4690,6 +4906,7 @@ static void nvmtl_zprobe_drain(void) {
         if (_e78NDisp) { _cb->_g79C2C = YES; if (_e78Loose || _g79Bar) _cb->_g79Owed = YES; }
         _e78Loose = NO; _g79Bar = NO;
     } else if (_e78Loose || _g79Bar) { nvmtl_vk_cmd_barrier(&_cb->_c); _e78Loose = NO; _g79Bar = NO; nvmtl_enc78_count(E78C_ENDFULL, 1); }
+    nvmtl_icontest_compute_end(self, _cb);
     nvmtl_g79_census();
     [_cb->_stTwins removeAllObjects];   // the next encoder copies each twin in again
     _cb->_nEnd++; nvmtl_enc78_census();
@@ -4730,6 +4947,7 @@ static NSUInteger nvmtl_texture_slice_count(NVMTLTexture *t) {
            sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
        destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dof {
     NVMTLTexture *s = (NVMTLTexture *)src, *d = (NVMTLTexture *)dst;
+    if (nvmtl_tex_is_lum(s) && d && !d->_lum) nvmtl_texture_lum_apply(d->_parent ? d->_parent : d, "blit copy (region)");
     if (!s || !d) { nvlog("blit copyFromTexture: nil"); return; }
     if (sl >= s.mipmapLevelCount || dl >= d.mipmapLevelCount || ss >= nvmtl_texture_slice_count(s) || ds >= nvmtl_texture_slice_count(d)) {
         nvlog("blit copyFromTexture: subresource outside view"); return;
@@ -4780,6 +4998,7 @@ static NSUInteger nvmtl_texture_slice_count(NVMTLTexture *t) {
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)dst
        destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)nslices levelCount:(NSUInteger)nlevels {
     NVMTLTexture *s = (NVMTLTexture *)src, *d = (NVMTLTexture *)dst;
+    if (nvmtl_tex_is_lum(s) && d && !d->_lum) nvmtl_texture_lum_apply(d->_parent ? d->_parent : d, "blit copy (slices)");
     if (!s || !d) { nvlog("blit copyFromTexture:sliceCount: nil"); return; }
     if (!_cb->_resources) _cb->_resources = [NVMTLResSet new];
     [_cb->_resources addObject:s]; [_cb->_resources addObject:d];

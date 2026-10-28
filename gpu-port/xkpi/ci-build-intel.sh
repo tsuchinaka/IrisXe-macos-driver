@@ -104,6 +104,8 @@ run flags "$NMX_PY" gen_flags.py "$NMX_K/drm-kmod" amd.flags
 
 run core ./all.sh 60
 run i915 ./all-i915.sh 60
+# b184: Tiger Lake firmware built into the kext (xnu/nmx_fw_blobs.inc) - needed when OpenCore loads NMXGPU
+run fwembed "$NMX_PY" gen_fw_embedded.py xnu/nmx_fw_blobs.inc "$HERE/../../app/Resources/nullmoth-gpu-firmware.txt" /Library/NullMoth/firmware
 run runtime ./rt.sh
 # b80: an IOKit-side file that does not compile must not end as a kext with missing pieces (kmutil refuses it later)
 if grep -q "^runtime rc=0$" "$CI/status.txt"; then
@@ -186,11 +188,39 @@ build_nmxaccel() {
 }
 run nmxaccel build_nmxaccel
 
+# ---- b182: NMXAccel for macOS 26 Tahoe (-DNM_TAHOE: the IOAccelerator family classes as laid out in Tahoe, from the
+# reconstructed headers in kexts/NVRM/accel/re + tahoe_fwd.h). Built next to the Sequoia one into out/tahoe/; a failure
+# here does not touch the Sequoia build. The Intel-only display classes (NMXSurfaceM ..., "NMX_ACCEL && !NM_TAHOE")
+# are not in it yet - this stage shows what the Tahoe port of the accelerator still needs.
+build_nmxaccel_tahoe() {
+    local S="$HERE/../../kexts/NVRM" O="$W/out/tahoe/NMXAccel.kext" OG="$W/ogkm"
+    [ -d "$OG/src" ] || return 1
+    local SDK KHDR NV KMS; SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
+    NV="$OG/src/nvidia"; KMS="$OG/src/nvidia-modeset"
+    local INC=( -I"$NV/arch/nvalloc/unix/include" -I"$NV/arch/nvalloc/common/inc" -I"$OG/src/common/sdk/nvidia/inc"
+      -I"$OG/src/common/sdk/nvidia/inc/hw" -I"$OG/src/common/inc" -I"$OG/src/common/shared/inc" -I"$NV/inc" -I"$NV/inc/os"
+      -I"$NV/inc/kernel" -I"$NV/kernel/inc" -I"$NV/interface" -I"$NV/inc/libraries" -I"$NV/generated"
+      -I"$KMS/os-interface/include" -I"$KMS/kapi/interface" -I"$KMS/kapi/include" -I"$OG/src/common/unix/nvidia-push/interface"
+      -I"$KMS/interface" -I"$KMS/include" -I"$OG/src/common/unix/common/inc" -I"$OG/src/common/modeset"
+      -I"$OG/src/common/unix/common/utils/interface" )
+    mkdir -p "$O/Contents/MacOS" "$W/accel26"
+    xcrun clang++ -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$S" "${INC[@]}" \
+        -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -DNVCPU_X86_64=1 -DNV_UNIX=1 -DNMX_ACCEL -DNM_TAHOE \
+        -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -Wall -Wno-unused-parameter \
+        -Wno-inconsistent-missing-override -Wno-unused-function -O2 \
+        -I"$S/accel" -I"$S/accel/iofam" -I"$S/accel/re" -c "$S/accel/nvrm-accel.cpp" -o "$W/accel26/nmx-accel.o" || return 1
+    xcrun clang++ -arch x86_64 -mmacosx-version-min="$NMX_MIN_OS" -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod \
+        -lcc_kext "$W/accel26/nmx-accel.o" -o "$O/Contents/MacOS/NMXAccel" || return 1
+    cp "$S/accel/nmx/Info.plist" "$O/Contents/Info.plist"
+    echo "NMXAccel.kext (Tahoe): $(stat -f %z "$O/Contents/MacOS/NMXAccel") bytes"
+}
+run nmxaccel26 build_nmxaccel_tahoe
+
 # ---- summary -------------------------------------------------------------------------------------------------------
 say ""
 say "## Stages"
 say ""
-for st in flags core i915 runtime link intelfb agdc drmprobe nmxaccel; do
+for st in flags fwembed core i915 runtime link intelfb agdc drmprobe nmxaccel nmxaccel26; do
     rc=$(sed -n "s/^$st rc=//p" "$CI/status.txt")
     line=$(grep -E "^(sources:|runtime sources:)" "$CI/$st.txt" 2>/dev/null | tail -1)
     say "- **$st**: exit $rc ${line:+- $line}"

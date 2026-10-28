@@ -210,6 +210,18 @@ class NMXGPUFB : public IOFramebuffer {
        gives up), or for nmxdeferto seconds (default 60). -nmxnohold: hand over at the first open, as b164. */
     bool fHold = false;
     uint64_t fGoDeadline = 0;
+    /* b183: the hold waits for an accelerated WindowServer - pointless without NMXAccel (Tahoe T1 test: NMXGPU alone,
+       same boot-args as Sequoia -> the logo stayed for the 60 s timeout). 15 s after start with no NMXAccel: hand over. */
+    uint64_t fNoAccelBy = 0;
+    static bool accelPresent() {
+        OSDictionary *m = IOService::serviceMatching("NMXAccel");
+        if (m == nullptr) return true;           /* cannot tell: keep holding */
+        OSIterator *it = IOService::getMatchingServices(m);
+        m->release();
+        bool yes = false;
+        if (it) { yes = it->getNextObject() != nullptr; it->release(); }
+        return yes;
+    }
     /* b168: the helper's signal must be THIS boot's: b167 handed over at 12 s on a signal left in NVRAM by the boot
        before. NMXGPUFB publishes a per-boot token (ioreg NMXHoldToken); only nmx-handover=<that token> counts. */
     char fHoldToken[20] = {0};
@@ -261,15 +273,17 @@ class NMXGPUFB : public IOFramebuffer {
             uint64_t now = mach_absolute_time();
             if (!me->fSignalAt && !PE_parse_boot_argn("-nmxholdpic", nullptr, 0) && me->nvramFlagTake("nmx-handover")) {
                 /* b174: hand over with the restarted WindowServer's first frame, not buffer 0's old lock screen;
-                   if no frame comes within 4 s, hand over anyway */
+                   if no frame comes within 2 s, hand over anyway. b198: 2 s, was 4 - with the accelerated WindowServer
+                   the frames reach the panel by copy-forward, not by a flip, so the 4 s always ran out (Tahoe 10-28:
+                   "no new frame in 4 s", 4 s of every boot) */
                 if (nmx_fb_go_on_flip(me->fDev, "autoarm helper signal, first frame of the restarted WindowServer") == 0) {
-                    uint64_t d; clock_interval_to_deadline(4000, kMillisecondScale, &d);
+                    uint64_t d; clock_interval_to_deadline(2000, kMillisecondScale, &d);
                     me->fFlipBy = d;
-                    FBLOG("hold: auto-arm helper signal - handing over with the next frame (at most 4 s)");
+                    FBLOG("hold: auto-arm helper signal - handing over with the next frame (at most 2 s)");
                 } else nmx_fb_go(me->fDev, "autoarm helper signal");
             }
             if (me->fFlipBy) {
-                if (mach_absolute_time() >= me->fFlipBy) nmx_fb_go(me->fDev, "autoarm helper signal, no new frame in 4 s");
+                if (mach_absolute_time() >= me->fFlipBy) nmx_fb_go(me->fDev, "autoarm helper signal, no new frame in 2 s");
                 else { uint64_t d; clock_interval_to_deadline(100, kMillisecondScale, &d); thread_call_enter_delayed(me->fGoCall, d); }
                 return;
             }
@@ -287,6 +301,7 @@ class NMXGPUFB : public IOFramebuffer {
                 else { uint64_t d; clock_interval_to_deadline(100, kMillisecondScale, &d); thread_call_enter_delayed(me->fGoCall, d); }
             }
             else if (now >= me->fGoDeadline) nmx_fb_go(me->fDev, "hold timeout");
+            else if (now >= me->fNoAccelBy && !me->accelPresent()) nmx_fb_go(me->fDev, "no accelerator (NMXAccel) after 15 s");
             else { uint64_t d; clock_interval_to_deadline(250, kMillisecondScale, &d); thread_call_enter_delayed(me->fGoCall, d); }
             return;
         }
@@ -530,6 +545,7 @@ public:
             if (PE_parse_boot_argn("nmxdeferto", &to, sizeof to) && (to < 5 || to > 900)) to = fHold ? 60 : 120;
             uint64_t gd; clock_interval_to_deadline((uint32_t)to * 1000u, kMillisecondScale, &gd);
             fGoDeadline = gd;
+            clock_interval_to_deadline(15000, kMillisecondScale, &fNoAccelBy);
             if (fHold) {
                 snprintf(fHoldToken, sizeof fHoldToken, "%llx", (unsigned long long)(mach_absolute_time() ^ 0x5a5a17ull));
                 setProperty("NMXHoldToken", fHoldToken);

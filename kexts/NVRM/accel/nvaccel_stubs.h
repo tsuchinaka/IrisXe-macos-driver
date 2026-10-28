@@ -211,12 +211,13 @@ public:
     unsigned fIopNext;
 };
 OSDefineMetaClassAndStructors(NVDisplayPipe, IOAccelLegacyDisplayPipe)
-#if defined(NMX_ACCEL) && !defined(NM_TAHOE)
+#if defined(NMX_ACCEL)   /* b185: also Tahoe */
 /* b116 (DESIGN.md R4): the MODERN family classes, as Apple's own Intel driver uses them (AppleIntelICLGraphics:
    IGAccelSurface : IOAccelSurface, IGAccelDisplayPipe : IOAccelDisplayPipe, IGAccelDisplayMachine : IOAccelDisplayMachine).
    NMXSurface / NMXDisplayPipe / NMXDisplayMachine are the LEGACY (NVIDIA-era) ones. Boot-arg nmxmodern=1 picks these. */
 class NMXSurfaceM : public IOAccelSurface {
     OSDeclareDefaultStructors(NMXSurfaceM)
+    NMX_TAHOE_FWD_NMXSurfaceM
 public:
     bool copyFromBuffer(int, int, int, int, unsigned int, unsigned int, IOAccelEvent*, IOAccelResource2*, IOAccelSysMemory*, unsigned int, unsigned long long, unsigned int) APPLE_KEXT_OVERRIDE { static SInt32 n; if (OSIncrementAtomic(&n) < 4) ALOG("NMXSurfaceM::copyFromBuffer (b116)"); return false; }
     bool copyToBuffer(int, int, int, int, unsigned int, unsigned int, IOAccelEvent*, IOAccelResource2*, IOAccelSysMemory*, unsigned int, unsigned long long, unsigned int) APPLE_KEXT_OVERRIDE { static SInt32 n; if (OSIncrementAtomic(&n) < 4) ALOG("NMXSurfaceM::copyToBuffer (b116)"); return false; }
@@ -230,6 +231,7 @@ public:
 OSDefineMetaClassAndStructors(NMXSurfaceM, IOAccelSurface)
 class NMXDisplayPipeM : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(NMXDisplayPipeM)
+    NMX_TAHOE_FWD_NMXDisplayPipeM
 public:
     void enableVBLInterrupt() APPLE_KEXT_OVERRIDE { nmxPipeNote(kPipeVblOn, this, nullptr); IOAccelDisplayPipe::enableVBLInterrupt(); }
     void disableVBLInterrupt() APPLE_KEXT_OVERRIDE { nmxPipeNote(kPipeVblOff, this, nullptr); IOAccelDisplayPipe::disableVBLInterrupt(); }

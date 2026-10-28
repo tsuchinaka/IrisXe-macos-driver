@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+gpu-port/xkpi/xnu/nmx_fw_blobs.inc
