@@ -5,6 +5,7 @@
  */
 
 #include <dlfcn.h>
+#include <syslog.h>
 #include <mach-o/loader.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -245,6 +246,15 @@ INSTANCE_FNS(DECL) DEVICE_FNS(DECL)
 #define LOAD_I(f) do { p##f = (PFN_##f)pvkGetInstanceProcAddr(g_inst, #f); if (!p##f) { nvlog("vk: missing %s", #f); return -1; } } while (0);
 #define LOAD_D(f) do { p##f = (PFN_##f)pvkGetDeviceProcAddr(g_dev, #f);   if (!p##f) { nvlog("vk: missing %s", #f); return -1; } } while (0);
 
+/* b211: memory types in use (see memtype_note): every successful vkAllocateMemory records its type */
+static volatile uint32_t g_mtypes_used;
+static VkResult nvmtl_alloc_noted(VkDevice dev, const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *allocator, VkDeviceMemory *out)
+{
+    VkResult r = pvkAllocateMemory(dev, info, allocator, out);
+    if (r == VK_SUCCESS && info && info->memoryTypeIndex < 32) __atomic_fetch_or(&g_mtypes_used, 1u << info->memoryTypeIndex, __ATOMIC_RELAXED);
+    return r;
+}
+#define pvkAllocateMemory(d, i, a, m) nvmtl_alloc_noted((d), (i), (a), (m))
 _Static_assert(sizeof(VkBuffer) == sizeof(void *) && _Alignof(VkBuffer) == _Alignof(void *), "VkBuffer bridge ABI");
 static VkResult nvmtl_opaque_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
@@ -1016,7 +1026,14 @@ void nvmtl_vk_pubcaps(uint32_t *color_samples, uint32_t *depth_samples, uint64_t
     }
 }
 
-static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
+/* b211: every memory type this driver has ever allocated from (buffers, heaps, images). A buffer texture aliases its
+   buffer's memory, so the image must accept the type that memory has; that type is not kept per buffer, but it is
+   always one of these. Before b211 the image had to accept EVERY type the device has (0x3f): Iris Xe images take
+   only 0x7, so every buffer texture was refused and newTextureWithDescriptor:offset:bytesPerRow: returned nil -
+   Tahoe's icon renderer then sampled whatever texture was bound before (10-28: shapes from an earlier icon, a full
+   square -> the solid style-colour icons). */
+static int memtype_note(int t) { if (t >= 0 && t < 32) __atomic_fetch_or(&g_mtypes_used, 1u << t, __ATOMIC_RELAXED); return t; }
+static int memtype_pick(uint32_t bits, VkMemoryPropertyFlags want)
 {
     if (want & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
         for (uint32_t i = 0; i < g_memp.memoryTypeCount; i++)
@@ -1026,6 +1043,7 @@ static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
         if ((bits & (1u << i)) && (g_memp.memoryTypes[i].propertyFlags & want) == want) return (int)i;
     return -1;
 }
+static int memtype(uint32_t bits, VkMemoryPropertyFlags want) { return memtype_note(memtype_pick(bits, want)); }
 
 #define NVMTL_POOL_BLOCK (32u << 20)
 #define NVMTL_POOL_MAX   (4u << 20)
@@ -1052,7 +1070,7 @@ static int bar1_memtype(uint32_t bits, VkDeviceSize size)
         { static int said; if (!said++) nvlog("vk: shared-in-VRAM: memory type %u flags 0x%x heap %u of %llu MB, budget %llu MB",
               i, g_memp.memoryTypes[i].propertyFlags, g_memp.memoryTypes[i].heapIndex, (unsigned long long)(heap >> 20), (unsigned long long)(budget >> 20)); }
         if (g_bar1_bytes + size > budget) { static int full; if (!full++) nvlog("vk: shared-in-VRAM budget full (%zu + %llu > %llu bytes) - system RAM from here", g_bar1_bytes, (unsigned long long)size, (unsigned long long)budget); return -1; }
-        return (int)i;
+        return memtype_note((int)i);
     }
     { static int said; if (!said++) nvlog("vk: shared-in-VRAM: no DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type in bits 0x%x", bits); }
     return -1;
@@ -7075,12 +7093,15 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
     uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
     size_t at = b->moff + offset;
     /* 10-18 zero-copy: an image over imported host memory only has to accept the one memory type that memory has */
-    uint32_t need = (b->imported && g_host_mtype >= 0) ? (1u << g_host_mtype) : all;
+    uint32_t used = __atomic_load_n(&g_mtypes_used, __ATOMIC_RELAXED) & all;
+    uint32_t need = (b->imported && g_host_mtype >= 0) ? (1u << g_host_mtype) : (used ? used : all);   /* b211: the types in use, not all */
     const char *why = (mr.memoryTypeBits & need) != need ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
     if (why) {
         nvlog("buffer texture: refused on %s - image types 0x%x of 0x%x, bind at %zu (buffer %zu + %zu) vs alignment %llu",
               why, mr.memoryTypeBits, all, at, b->moff, offset, (unsigned long long)mr.alignment);
         pvkDestroyImage(g_dev, (VkImage)out->img, NULL); memset(out, 0, sizeof *out); return -1; }
+    if ((mr.memoryTypeBits & all) != all) { static int said; if (said++ < 3)
+        syslog(LOG_NOTICE, "NullMoth: buffer texture: %ux%u VkFormat %u accepted - image memory types 0x%x cover the types in use 0x%x (b211; refused before)", w, h, vkfmt, mr.memoryTypeBits, need); }
     if (mr.size > b->size - offset)
         nvlog("buffer texture: image size %llu runs %llu B past the buffer's %zu at offset %zu (the tail of the last row, never addressed)",
               (unsigned long long)mr.size, (unsigned long long)(mr.size - (b->size - offset)), b->size, offset);

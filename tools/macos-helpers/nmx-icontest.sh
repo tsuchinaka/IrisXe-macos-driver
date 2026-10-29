@@ -25,8 +25,12 @@ collect)
     echo "saved: $D/nmx-icontest.tar.gz ($(du -h "$D/nmx-icontest.tar.gz" | cut -f1))" ;;
 off)
     rm -f "$F"
-    grep -q '^ *- *iconservicesagent *$' "$A" || { { echo '- iconservicesagent'; cat "$A"; } > "$A.tmp" && cat "$A.tmp" > "$A"; rm -f "$A.tmp"; }
-    clear_icons
-    echo "icon test OFF - iconservicesagent is off the GPU again, icons are redrawn on the CPU" ;;
+    if grep -aq 'b211; refused before' /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver 2>/dev/null && [ ! -e /Library/GPUBundles/nvmtl-iconcpu ]; then
+        clear_icons; echo "icon test OFF - icons stay on the GPU (plugin b211 or later)"
+    else
+        grep -q '^ *- *iconservicesagent *$' "$A" || { { echo '- iconservicesagent'; cat "$A"; } > "$A.tmp" && cat "$A.tmp" > "$A"; rm -f "$A.tmp"; }
+        clear_icons
+        echo "icon test OFF - iconservicesagent is off the GPU again, icons are redrawn on the CPU"
+    fi ;;
 *) sed -n 2,8p "$0"; exit 1 ;;
 esac

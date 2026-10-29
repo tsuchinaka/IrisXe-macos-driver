@@ -83,6 +83,8 @@ cmd_status() {
         else lock="${lock:+$lock + }ACCELERATION LOCKED"; fi
     fi
     say "locks|${lock:-none}|"
+    local hl; hl=$(tail -1 "/Library/Application Support/IrisXe/hangs.txt" 2>/dev/null)
+    [ -n "$hl" ] && say "last hang|${hl//|/;}|"
     local ba; ba=$(sysctl -n kern.bootargs)
     local miss=""; for a in nmxintel=1 nmxaccel=1 nmxws=1 nmxautoarm=1; do grep -qw -- "$a" <<<"$ba" || miss="$miss $a"; done
     say "bootargs|${miss:+missing:$miss}${miss:-ok}|"
@@ -167,6 +169,15 @@ cmd_install() {
 # ---------- repair / arm ----------
 cmd_repair() {
     need_root
+    # b209: keep what the stuck boot left behind before clearing the locks (the next good boot overwrites the breadcrumb)
+    local H="/Library/Application Support/IrisXe/hangs.txt"; mkdir -p "$(dirname "$H")"
+    local hs ls as; hs=$(nvram nullmoth-hang-step 2>/dev/null | cut -f2-); ls=$(nvram nullmoth-last-step 2>/dev/null | cut -f2-)
+    as=$(nvram nmx-autoarm-step 2>/dev/null | cut -f2-)
+    if [ -n "$(nvram nullmoth-gpu-attaching 2>/dev/null)" ] || [ -n "$hs" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M') macOS $(sw_vers -productVersion): display driver stopped after step: ${hs:-$ls}; autoarm: ${as:-none}" >> "$H"
+        say "recorded the stuck boot in $H: last step '${hs:-$ls}'"
+    fi
+    nvram -d nullmoth-hang-step 2>/dev/null
     nvram -d nmx-autoarm-step 2>/dev/null && say "acceleration safety lock cleared" || say "acceleration safety lock: was not set"
     nvram -d nullmoth-gpu-attaching 2>/dev/null && say "display driver boot guard cleared" || say "display driver boot guard: was not set"
     say "Restart the Mac now. If it hangs again, hold the power button - the guard parks the driver again by itself."

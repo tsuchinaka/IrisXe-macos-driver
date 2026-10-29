@@ -51,11 +51,8 @@ Measured on the tested machine, idle desktop on battery at 11 % brightness: abou
   restarted once, accelerated, because the driver loads after it starts.
 - External displays (HDMI / USB-C): mirroring of the laptop screen only, not yet tested on hardware; no extended desktop.
 - A Metal app that is not on the allow-list gets no GPU device.
-- **Tahoe:** app and settings icons are drawn by the CPU (`- iconservicesagent` in the allow-list, added by the
-  acceleration helper). On the GPU, Tahoe's icon renderer fills the symbol as a solid square in the style colour
-  (yellow / blue / white); not fixed yet. Icons therefore appear slowly the first time and the CPU works harder.
 - **Tahoe is slower and warmer than Sequoia** on the same laptop: the Liquid Glass interface needs much more GPU work
-  per frame, icons are drawn on the CPU (above), and a new install indexes for days. System Settings -> Accessibility ->
+  per frame, and a new install indexes for days. System Settings -> Accessibility ->
   Display -> **Reduce transparency** removes most of the glass work.
 - Tahoe's desktop is scaled 1x (not HiDPI) on the tested panel.
 
@@ -165,7 +162,7 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nvmtl-ciflip` | Apps whose Core Image output is flipped (default: Photo Booth; an empty file turns it off) |
 | `nvmtl-standincopy` | Old copy mode for small image uploads (causes stale text - diagnostic only) |
 | `nmx-autoarm-slow` / `nmx-autoarm-fast` | Slower / faster acceleration helper timings |
-| `nvmtl-icongpu` | Tahoe: let iconservicesagent use the GPU (icons draw wrong - test only) |
+| `nvmtl-iconcpu` | Tahoe: draw app icons on the CPU (the fallback before b211; slower) |
 | `nvmtl-icontest` | Tahoe: icon test mode with captures (use `nmx-icontest.sh`) |
 | `nvmtl-nolumswizzle` | Turn off the luminance swizzle for one-channel (LA08 / L008) surfaces |
 
@@ -180,6 +177,7 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nmx-autoarm/nmx-autoarm-report.sh` | The acceleration helper's last boot |
 | `nmx-speed.sh` | CPU time of WindowServer, logd, iconservicesagent and others over a minute, driver log lines, quiet / verbose plugin |
 | `nmx-icontest.sh` | Tahoe icon test: `on`, `collect`, `off` |
+| `nmx-hidpi.sh` | `on` / `off` / `status`: HiDPI (Retina) desktop sizes for the panel through a display override - sharper text and icons (test) |
 
 Driver log: `log show --last boot --predicate 'eventMessage contains "NullMoth"'`.
 

@@ -2846,31 +2846,92 @@ static void nvmtl_icontest_note_pipeline(id enc, NVMTLRenderPipelineState *ps) {
     NSString *n = [NSString stringWithFormat:@"%@/%@%@", ps->_vname ?: @"-", ps->_fname ?: @"-", [ps->_blend hasPrefix:@"1"] ? @"+blend" : @""];
     if (a.count < 10 && ![a containsObject:n]) [a addObject:n];
 }
+/* b207/b208: which images the image-drawing shaders sample.
+   b206 (10-28): the broken layers are single primitive_image_fragment draws that fill the whole target with the style
+   colour (Activity Monitor pass 177: yellow 128x128; pass 195: an R8 mask that comes out all white), and their 130x130
+   RGB10A2 "normal" image comes out one flat colour (1, 0.5, 0.5). b207 (10-28): with every pass saved, the first 300
+   slots were used up by icons that came out right (FaceTime, Terminal, QuickTime, Settings); the broken normal images
+   showed up only in the getBytes read-backs later.
+   b208: every pass is still logged (up to 4000 lines, with its encoder number), but pixels are saved only for passes
+   that ran primitive_image_fragment (up to 500) together with the textures that encoder's fragment stage had bound
+   (up to 800, each once per encoder): src-<enc>-i<index>-fmt<F>-<W>x<H>.raw. */
+static char nvmtl_icontest_enc_key, nvmtl_icontest_src_key;
+static int nvmtl_icontest_enc_no(id enc) {
+    NSNumber *n = objc_getAssociatedObject(enc, &nvmtl_icontest_enc_key);
+    if (!n) { static int next; n = @(__atomic_fetch_add(&next, 1, __ATOMIC_RELAXED));
+        objc_setAssociatedObject(enc, &nvmtl_icontest_enc_key, n, OBJC_ASSOCIATION_RETAIN); }
+    return n.intValue;
+}
+static void nvmtl_icontest_save(NVMTLTexture *t, const char *name) {
+    nvk_image *i = [t nvi]; if (!i || !i->img) return;
+    const size_t row = (size_t)i->w * i->bpp; void *px = malloc(row * i->h);
+    if (!px) return;
+    NVMTLTexture *base = t->_parent ? t->_parent : t; const unsigned long mf = (unsigned long)(t->_fmt ? t->_fmt : base->_fmt);
+    if (nvmtl_vk_image_read(t->_q, i, px, row) == 0) {
+        char dir[900]; size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, dir, sizeof dir);
+        if (!n || n > sizeof dir) snprintf(dir, sizeof dir, "/tmp/");
+        char path[1100]; snprintf(path, sizeof path, "%snvmtl-icontest", dir); mkdir(path, 0755);
+        snprintf(path, sizeof path, "%snvmtl-icontest/%s-fmt%lu-%ux%u.raw", dir, name, mf, i->w, i->h);
+        FILE *f = fopen(path, "wb");
+        if (f) { uint32_t hdr[5] = { 0x5449564e, i->w, i->h, (uint32_t)row, (uint32_t)mf }; fwrite(hdr, sizeof hdr, 1, f); fwrite(px, row, i->h, f); fclose(f); }
+    }
+    free(px);
+}
+static int nvmtl_icontest_savable(nvk_image *im, uint32_t minpx) {
+    return im && im->img && im->w >= minpx && im->h >= minpx && im->w <= 512 && im->h <= 512 &&
+           (im->bpp == 1 || im->bpp == 2 || im->bpp == 4 || im->bpp == 8);
+}
+static void nvmtl_icontest_note_ftex(id enc, NVMTLCommandBuffer *cb, NVMTLRenderPipelineState *ps, NVMTLTexture *nt, NSUInteger idx) {
+    if (!nt || !cb || !nvmtl_icontest_on()) return;
+    /* textures are often set before the pipeline: the shader shown is the one set at that moment */
+    NSString *fn = (ps ? ps->_fname : nil) ?: @"(no pipeline yet)";
+    const int e = nvmtl_icontest_enc_no(enc);
+    NVMTLTexture *base = nt->_parent ? nt->_parent : nt;
+    nvk_image *im = [nt nvi];
+    static int nlog;
+    if (__atomic_fetch_add(&nlog, 1, __ATOMIC_RELAXED) < 4000)
+        syslog(LOG_NOTICE, "NVMTL ICONTEST ftex: enc %d %s[%lu] %p %ux%u viewfmt %lu basefmt %lu vk %u bpp %u swz %d swzView %d lum %d view %d ownView %d tb %d%s",
+               e, fn.UTF8String, (unsigned long)idx, (__bridge void *)nt, im ? im->w : 0, im ? im->h : 0, (unsigned long)nt->_fmt, (unsigned long)base->_fmt,
+               im ? im->fmt : 0, im ? im->bpp : 0, (int)nt->_hasSwz, nt->_swzView != NULL, (int)nt->_lum, nt->_parent != nil,
+               nt->_ownView != NULL, nt->_tbView != NULL, base->_surf ? " IOSURFACE" : "");
+    if (!nvmtl_icontest_savable(im, 8)) return;
+    NSMutableArray *a = objc_getAssociatedObject(enc, &nvmtl_icontest_src_key);
+    if (!a) { a = [NSMutableArray new]; objc_setAssociatedObject(enc, &nvmtl_icontest_src_key, a, OBJC_ASSOCIATION_RETAIN); }
+    for (NSArray *x in a) if (x[0] == nt && [x[1] unsignedIntegerValue] == idx) return;
+    if (a.count < 12) [a addObject:@[nt, @(idx)]];
+}
 static void nvmtl_icontest_pass_end(id enc, NVMTLCommandBuffer *cb, NVMTLTexture *target) {
     if (!target || !cb || !nvmtl_icontest_on()) return;
     nvk_image *im = [target nvi];
-    /* b199: icon-sized passes only (>= 64 px), up to 300 - b191..b196 filled the 120 slots with 16-32 px glyphs */
-    if (!im || !im->img || im->w > 512 || im->h > 512 || im->w < 64 || im->h < 64 || (im->bpp != 1 && im->bpp != 2 && im->bpp != 4 && im->bpp != 8)) return;
-    static int npass;
+    if (!nvmtl_icontest_savable(im, 64)) return;
+    static int npass, nsaved, nsrc;
     const int k = __atomic_fetch_add(&npass, 1, __ATOMIC_RELAXED);
-    if (k >= 300) return;
+    if (k >= 4000) return;
     NSArray *fns = [objc_getAssociatedObject(enc, &nvmtl_icontest_key) copy] ?: @[];
+    NSString *joined = [fns componentsJoinedByString:@" | "];
+    BOOL want = [joined rangeOfString:@"primitive_image_fragment"].location != NSNotFound;
+    int slot = -1;
+    if (want) { slot = __atomic_fetch_add(&nsaved, 1, __ATOMIC_RELAXED); if (slot >= 500) slot = -1; }
+    NSArray *srcs = slot >= 0 ? [objc_getAssociatedObject(enc, &nvmtl_icontest_src_key) copy] : nil;
     NVMTLTexture *t = target; const unsigned long mf = (unsigned long)target->_fmt;
+    const int encNo = nvmtl_icontest_enc_no(enc);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
         nvk_image *i = [t nvi]; const size_t row = (size_t)i->w * i->bpp; void *px = malloc(row * i->h);
         if (!px) return;
         const int bad = nvmtl_vk_image_read(t->_q, i, px, row);
-        char dir[900]; size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, dir, sizeof dir);
-        if (!n || n > sizeof dir) snprintf(dir, sizeof dir, "/tmp/");
-        char path[1100]; snprintf(path, sizeof path, "%snvmtl-icontest", dir); mkdir(path, 0755);
-        snprintf(path, sizeof path, "%snvmtl-icontest/pass-%03d-fmt%lu-%ux%u.raw", dir, k, mf, i->w, i->h);
-        if (!bad) { FILE *f = fopen(path, "wb");
-            if (f) { uint32_t hdr[5] = { 0x5449564e, i->w, i->h, (uint32_t)row, (uint32_t)mf }; fwrite(hdr, sizeof hdr, 1, f); fwrite(px, row, i->h, f); fclose(f); } }
         const uint8_t *c = (const uint8_t *)px + (size_t)(i->h / 2) * row + (size_t)(i->w / 2) * i->bpp;
         char hex[40] = ""; for (uint32_t q = 0; q < i->bpp && !bad; q++) snprintf(hex + q * 2, 3, "%02x", c[q]);
-        syslog(LOG_NOTICE, "NVMTL ICONTEST pass %d: %ux%u fmt %lu centre %s%s cb-status %ld fns %s", k, i->w, i->h, mf,
-               bad ? "(read FAILED)" : hex, "", (long)b.status, [[fns componentsJoinedByString:@" | "] UTF8String]);
+        syslog(LOG_NOTICE, "NVMTL ICONTEST pass %d: %ux%u fmt %lu centre %s enc %d%s cb-status %ld fns %s", k, i->w, i->h, mf,
+               bad ? "(read FAILED)" : hex, encNo, slot >= 0 ? " SAVED" : "", (long)b.status, joined.UTF8String);
         free(px);
+        if (slot < 0) return;
+        char name[64]; snprintf(name, sizeof name, "pass-%04d-e%04d", k, encNo);
+        nvmtl_icontest_save(t, name);
+        for (NSArray *x in srcs) {
+            if (__atomic_fetch_add(&nsrc, 1, __ATOMIC_RELAXED) >= 800) break;
+            snprintf(name, sizeof name, "src-e%04d-i%lu", encNo, (unsigned long)[x[1] unsignedIntegerValue]);
+            nvmtl_icontest_save(x[0], name);
+        }
     }];
 }
 
@@ -3333,6 +3394,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     if (!nt) { nvlog("setFragmentTexture: nil at index %lu", (unsigned long)i); return; }
     nvmtl_retain_resource(_cb, nt);
     nvmtl_surface_cpu_dump(nt->_parent ? nt->_parent : nt);
+    nvmtl_icontest_note_ftex(self, _cb, _ps, nt, i);
     nvmtl_surface_in_for_cb(_cb, nt);
     { NVMTLTexture *rt = nt->_parent ? nt->_parent : nt; nvtrace("FTEX[%lu] %ux%u surf %u view %d", (unsigned long)i, [nt nvi]->w, [nt nvi]->h,
         rt->_surf ? (unsigned)IOSurfaceGetID(rt->_surf) : 0u, nt->_parent != nil); }

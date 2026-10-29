@@ -499,6 +499,24 @@ void NMXGPU::attachNow()
         return;
     }
     if (nmx_marker_set()) {
+        /* b209: the hung boot's last breadcrumb is still in nullmoth-last-step here, but the next good boot overwrites
+           it (10-28: a cold start hung, the evidence was gone by the time it was read). Keep a copy that only this
+           branch writes: nullmoth-hang-step, and say it in the log. */
+        if (IODTNVRAM *n = nmx_nvram()) {
+            OSObject *lo = n->copyProperty("nullmoth-last-step");
+            OSData *last = OSDynamicCast(OSData, lo);
+            char buf[100] = "(none)";
+            if (last && last->getLength()) {
+                unsigned len = last->getLength() < sizeof(buf) - 1 ? last->getLength() : (unsigned)sizeof(buf) - 1;
+                memcpy(buf, last->getBytesNoCopy(), len); buf[len] = 0;
+                const OSSymbol *k = OSSymbol::withCString("nullmoth-hang-step");
+                if (k) { n->setProperty(k, last); k->release(); }
+                n->sync();
+            }
+            if (lo) lo->release();
+            n->release();
+            IOLog("NullMoth GPU: the hung boot stopped after step \"%s\" (kept in nvram nullmoth-hang-step)\n", buf);
+        }
         IOLog("NullMoth GPU: the last attach of %04x:%04x never returned (the Mac stopped or restarted); this GPU stays "
               "with macOS. Send logs, then turn the test driver off and on to try again\n",
               pci_->configRead16(kIOPCIConfigVendorID), pci_->configRead16(kIOPCIConfigDeviceID));

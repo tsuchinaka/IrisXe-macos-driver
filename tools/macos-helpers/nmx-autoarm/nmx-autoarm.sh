@@ -1,5 +1,5 @@
 #!/bin/bash
-# nmx-autoarm.sh (v11) - Phase 3: turn GPU acceleration (WindowServer on the Iris Xe) on at every boot, no script to run.
+# nmx-autoarm.sh (v12) - Phase 3: turn GPU acceleration (WindowServer on the Iris Xe) on at every boot, no script to run.
 # Runs once at boot from the LaunchDaemon com.nullmoth.autoarm. Log: /var/log/nmx-autoarm.log
 #
 # The boot-arg picks the mode (no nmxautoarm boot-arg = off):
@@ -20,7 +20,7 @@
 # Waiting steps never trip the guard (v3 tripped it after a normal shutdown during its wait, or after any early exit).
 LOG=/var/log/nmx-autoarm.log
 exec >>"$LOG" 2>&1
-echo "=== $(date) boot (autoarm v11)"
+echo "=== $(date) boot (autoarm v12)"
 # v5 (b136, 10-22): the waits were sized for the freeze hunt (45 s stable WindowServer, 120 s since boot, 20 s watch):
 # acceleration came ~2 min after a restart. The driver is stable now, so: 8 s stable, 25 s since boot, 3 s watch.
 # The old, cautious timings come back with: sudo touch /Library/GPUBundles/nmx-autoarm-slow
@@ -141,18 +141,23 @@ A=/Library/GPUBundles/nvmtl-allow.txt
 grep -qx '!WindowServer' "$A" 2>/dev/null || echo '!WindowServer' >> "$A"
 # b124: the live Sequoia / Macintosh wallpapers draw with Metal; without a device they fail and the previous wallpaper stays
 for n in WallpaperSequoiaExtension WallpaperMacintoshExtension; do grep -qx "!$n" "$A" 2>/dev/null || echo "!$n" >> "$A"; done
-# b190: iconservicesagent (Tahoe's icon renderer) kept off the GPU - on our device app icons and Settings glyphs come
-# out as solid yellow squares. b193 let it back on after a capture that looked right; the user's screen recording
-# (10-27) showed the yellow squares again, so b194 restores the default: off the GPU. Testing on the GPU:
-# sudo touch /Library/GPUBundles/nvmtl-icongpu (and restart). The icon test (nvmtl-icontest) also leaves it on.
+# b190: iconservicesagent (Tahoe's icon renderer) kept off the GPU - on our device app icons and Settings glyphs came
+# out as solid yellow squares. b211 (10-29) fixed the cause (buffer-backed textures were refused, so the renderer's
+# shapes never reached the GPU): from a plugin that has the b211 fix on, icons are drawn on the GPU again (v12).
+# Older plugins still get the CPU fallback. Back to the CPU by hand: sudo touch /Library/GPUBundles/nvmtl-iconcpu
+P=/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver
+ICON_GPU=1
 if [ "$(uname -r | cut -d. -f1)" -ge 25 ] && [ ! -e /Library/GPUBundles/nvmtl-icongpu ] && [ ! -e /Library/GPUBundles/nvmtl-icontest ]; then
+    if [ -e /Library/GPUBundles/nvmtl-iconcpu ] || ! grep -aq 'b211; refused before' "$P" 2>/dev/null; then ICON_GPU=0; fi
+fi
+if [ "$ICON_GPU" = 0 ]; then
     if ! grep -q '^ *- *iconservicesagent *$' "$A" 2>/dev/null; then
         { echo '- iconservicesagent'; cat "$A"; } > "$A.tmp" && cat "$A.tmp" > "$A"; rm -f "$A.tmp"
-        rm -rf /Library/Caches/com.apple.iconservices.store; step "Tahoe: iconservicesagent kept off the GPU, icon cache cleared"
+        rm -rf /Library/Caches/com.apple.iconservices.store; step "Tahoe: iconservicesagent kept off the GPU (nvmtl-iconcpu, or a plugin before b211), icon cache cleared"
     fi
 elif grep -q '^ *- *iconservicesagent *$' "$A" 2>/dev/null; then
     grep -v '^ *- *iconservicesagent *$' "$A" > "$A.tmp" && cat "$A.tmp" > "$A"; rm -f "$A.tmp"
-    rm -rf /Library/Caches/com.apple.iconservices.store; step "iconservicesagent on the GPU (test file present), icon cache cleared"
+    rm -rf /Library/Caches/com.apple.iconservices.store; step "iconservicesagent on the GPU (b211 plugin), icon cache cleared"
 fi
 # b124: the shader reader must be there (a whole-bundle replace from the kext build deletes it) - say so loudly
 [ -f /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib ] || step "WARNING: NVMTLDriver.bundle has NO air-runtime/libLLVM.dylib - new shaders will fail (restore it: nmx-plugin-update.sh)"
