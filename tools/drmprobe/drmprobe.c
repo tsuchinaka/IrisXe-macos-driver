@@ -66,7 +66,7 @@ int main(int argc, char **argv)
         r = ioctl(fd, IOC_GETPARAM, &gp);
         if (r) snprintf(buf, sizeof buf, "%s", strerror(errno));
         else snprintf(buf, sizeof buf, "%d (0x%x)", val, val);
-        res(params[i].n, r == 0 && (params[i].id != 4 || val == 0x9a49), buf);
+        res(params[i].n, r == 0 && (params[i].id != 4 || val == 0x9a49 || val == 0x9a78), buf);
     }
 
     struct i915_gem_create gc = { 4096, 0, 0 };

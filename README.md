@@ -25,6 +25,10 @@ kernel-port design, the Metal plugin and the shader translator come from NullMot
 
 Other Tiger Lake Iris Xe / UHD laptops may work; nothing else has been tested.
 
+This branch (`tgl-9a78-support`) adds the first non-9A49 bring-up target: the Tiger Lake-U **UHD Graphics 48 EU
+(`8086:9A78`, i3-1115G4)**. The driver path is the same TGL GT2 hardware; only the clock ceiling (1250 MHz) and the
+test acceptance needed changes. See [`docs/TGL-9A78-BRINGUP.md`](docs/TGL-9A78-BRINGUP.md).
+
 Sequoia and Tahoe use the same display driver, display helper and Metal plugin. Only the accelerator differs:
 the artifact's `out/NMXAccel.kext` is for Sequoia, `out/tahoe/NMXAccel.kext` for Tahoe (IrisXe Manager picks the right one).
 

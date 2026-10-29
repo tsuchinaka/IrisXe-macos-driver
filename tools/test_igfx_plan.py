@@ -33,7 +33,8 @@ class Plan(unittest.TestCase):
         self.assertEqual(r["VBLANK"], (1175 << 16) | 0)
 
     def test_device_ids_map_to_display_versions(self):
-        self.assertEqual(P.display_version(0x9A49), 12)   # Tiger Lake
+        self.assertEqual(P.display_version(0x9A49), 12)   # Tiger Lake Iris Xe 80 EU
+        self.assertEqual(P.display_version(0x9A78), 12)   # Tiger Lake UHD 48 EU
         self.assertEqual(P.display_version(0x46A6), 13)   # Alder Lake-P
         self.assertEqual(P.display_version(0xA788), 12)   # Raptor Lake-S (HX laptops)
         self.assertIsNone(P.display_version(0x3E9B))      # Coffee Lake: WhateverGreen's, not ours

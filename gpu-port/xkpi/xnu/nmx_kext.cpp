@@ -584,12 +584,12 @@ void NMXGPU::attachNow()
     {   /* b101: the GPU clock stayed at its lowest step (100 MHz of 100..1300) - see nmx_i915_gpu_floor. Default floor
            800 MHz; nmxgpumhz=<MHz> picks another (1300 = always full speed), nmxgpumhz=0 leaves i915's own choice. */
         uint32_t mhz = 550;   /* b146: 550 (was 800) - 10-23: 350-450 felt the same, 800 ran warmer */
+        int partLo = 0, partHi = 0;   /* b213: hardware RPS range, used to cap the governor (9A78 max is 1250) */
         PE_parse_boot_argn("nmxgpumhz", &mhz, sizeof(mhz));
         if (mhz > 0) {
             void *drm = nmx_drm_of(dev_);
-            int lo = 0, hi = 0;
-            int got = drm ? nmx_i915_gpu_floor((struct drm_device *)drm, (int)mhz, &lo, &hi) : -2;
-            IOLog("NullMoth GPU: nmxgpumhz=%u -> GPU clock floor %d MHz (part %d..%d MHz)%s\n", mhz, got, lo, hi,
+            int got = drm ? nmx_i915_gpu_floor((struct drm_device *)drm, (int)mhz, &partLo, &partHi) : -2;
+            IOLog("NullMoth GPU: nmxgpumhz=%u -> GPU clock floor %d MHz (part %d..%d MHz)%s\n", mhz, got, partLo, partHi,
                   got > 0 ? "" : " - NOT set");
         } else IOLog("NullMoth GPU: nmxgpumhz=0 - GPU clock left to i915\n");
         /* b138: idle clock. nmxgpuidle=<MHz> (default 350); nmxgpuidle=0 = the fixed floor above, as before b138 */
@@ -602,6 +602,10 @@ void NMXGPU::attachNow()
         PE_parse_boot_argn("nmxgpumax", &top, sizeof(top));
         if (top < 300) top = 300;
         if (top > 1300) top = 1300;
+        /* b213: never ask for more than the part reports. Tiger Lake UHD 48 EU (9A78) tops out at 1250 MHz,
+           so the old fixed 1300 ceiling over-requested on that SKU; 9A49 (80 EU) still gets 1300. */
+        if (partHi > 0 && top > (uint32_t)partHi) top = (uint32_t)partHi;
+        if (top < 300) top = 300;
         govStep_[0] = (int)idle; govStep_[3] = (int)top;
         for (int k = 1; k < 3; k++) if (govStep_[k] > (int)top) govStep_[k] = (int)top;
         if (govStep_[0] > govStep_[1]) govStep_[0] = govStep_[1];
